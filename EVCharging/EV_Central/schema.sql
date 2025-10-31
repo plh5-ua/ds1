@@ -16,17 +16,16 @@ CREATE TABLE IF NOT EXISTS drivers (
 );
 
 -- Tabla de sesiones de carga
-CREATE TABLE IF NOT EXISTS sessions ( 
+CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cp_id TEXT NOT NULL REFERENCES charging_points(id),
-    cp_location TEXT NOT NULL,
-    driver_id TEXT NOT NULL REFERENCES drivers(id) DEFAULT 'NINGUNO',
+    driver_id TEXT NOT NULL REFERENCES drivers(id),
     started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     ended_at DATETIME,
-    price_eur_kwh REAL,
+    price_eur_kwh REAL NOT NULL,
     kwh REAL NOT NULL DEFAULT 0,
     amount_eur REAL NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'PARADO' -- ACTIVAD | PARADO | SUMINISTRANDO | AVERIADO | DESCONECTADO
+    status TEXT NOT NULL DEFAULT 'RUNNING' -- RUNNING | ENDED | ABORTED | FAILED
 );
 
 -- Tabla de eventos (histórico)
