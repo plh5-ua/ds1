@@ -12,15 +12,16 @@ CP_LOCATION= input("Introduce la localización del punto de recarga: ").strip()
 
 STATUS = "ACTIVADO"
 
-async def register_cp(producer):
-    msg = {
-        "cp_id": CP_ID,
+
+async def send_register(producer):
+    payload = {
+        "id": CP_ID,
         "location": CP_LOCATION,
-        "price_eur_kwh": 0.30,
+        "kwh": round(random.uniform(0.40, 0.70), 2),
         "status": "PARADO"
     }
-    await producer.send_and_wait("cp.register", json.dumps(msg).encode())
-    print(f"📡 Registrando CP {CP_ID} en CENTRAL ({CP_LOCATION})")
+    await producer.send_and_wait("cp.register", json.dumps(payload).encode())
+    print(f"Charge point correctamente registrado: ID:{CP_ID} en la localizacion: {CP_LOCATION}")
 
 
 async def main():
@@ -31,9 +32,9 @@ async def main():
         value_deserializer=lambda b: json.loads(b.decode())
     )
     await producer.start()
-    await register_cp(producer)
+    await send_register(producer)
     await consumer.start()
-    print(f"🔌 EV_CP_E {CP_ID} conectado a {BROKER}")
+    print(f"EV_CP_E {CP_ID} conectado a {BROKER}")
     try:
         async for msg in consumer:
             data = msg.value
@@ -41,10 +42,10 @@ async def main():
             if data.get("cp_id") != CP_ID:
                 continue
             if msg.topic == "central.authorize":
-                print("✅ Autorizado suministro por CENTRAL")
+                print("Autorizado suministro por CENTRAL")
                 await start_charging(producer, data)
             elif msg.topic == "central.command":
-                print(f"⚙️ Orden recibida: {data['action']}")
+                print(f"Orden recibida: {data['action']}")
                 if data["action"].upper() == "PARAR":
                     await send_status(producer, "PARADO")
                 elif data["action"].upper() == "REANUDAR":
@@ -52,6 +53,9 @@ async def main():
     finally:
         await consumer.stop()
         await producer.stop()
+
+
+
 
 async def send_status(producer, status):
     global STATUS

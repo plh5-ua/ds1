@@ -12,6 +12,7 @@ import os
 import json
 import asyncio
 import sqlite3
+import random
 from contextlib import closing
 from typing import Dict, Any
 
@@ -81,25 +82,22 @@ def upsert_cp(cp_id: str, cp_location: str, status: str = None):
                 )
         else:
             cur.execute(
-                "INSERT INTO charging_points(cp_id, cp_location) VALUES(?, ?)",
+                "INSERT INTO charging_points(id, location) VALUES(?, ?)",
                 (cp_id, cp_location),
             )
         con.commit()
 
-def insert_cp(cp_id: str, cp_location: str, status: str = None):
+def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
     with closing(get_db()) as con:
         cur = con.cursor()
         row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
         if row:
             if status:
-                cur.execute(
-                    "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, cp_id),
-                )
+                print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
         else:
             cur.execute(
-                "INSERT INTO charging_points(cp_id, cp_location) VALUES(?, ?)",
-                (cp_id, cp_location),
+                "INSERT INTO charging_points(id, location,price_eur_kwh) VALUES(?, ?, ?)",
+                (cp_id, cp_location, kwh),
             )
         con.commit()
 
@@ -166,6 +164,7 @@ async def consume_kafka():
     kafka_consumer = AIOKafkaConsumer(
         "cp.heartbeat",
         "cp.status",
+        "cp.register",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
@@ -174,10 +173,12 @@ async def consume_kafka():
         async for msg in kafka_consumer:
             topic = msg.topic
             data = msg.value
-            cp_id = data.get("cp_id")
-            cp_location = data.get("cp_location")
+            cp_id = data.get("id")
+            cp_location = data.get("location")
+            kwh = data.get("kwh")
             if topic == "cp.register":
-                insert_cp(cp_id, cp_location)
+                print(f"Iniciando registro de CP {cp_id}")
+                insert_cp(cp_id, cp_location, kwh)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
             elif topic == "cp.status":
                 upsert_cp(cp_id, data.get("status"))
