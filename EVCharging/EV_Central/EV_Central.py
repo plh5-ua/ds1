@@ -12,7 +12,6 @@ import os
 import json
 import asyncio
 import sqlite3
-import random
 from contextlib import closing
 from typing import Dict, Any
 
@@ -70,7 +69,7 @@ def init_db():
         con.commit()
 
 
-def upsert_cp(cp_id: str, cp_location: str, status: str = None):
+def update_cp(cp_id: str, cp_location: str, status: str = None):
     with closing(get_db()) as con:
         cur = con.cursor()
         row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
@@ -81,10 +80,8 @@ def upsert_cp(cp_id: str, cp_location: str, status: str = None):
                     (status, cp_id),
                 )
         else:
-            cur.execute(
-                "INSERT INTO charging_points(id, location) VALUES(?, ?)",
-                (cp_id, cp_location),
-            )
+            print(f"ERROR: no se ha podido actualizar el estado del CP")
+
         con.commit()
 
 def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
@@ -92,8 +89,7 @@ def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
         cur = con.cursor()
         row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
         if row:
-            if status:
-                print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
+            print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
         else:
             cur.execute(
                 "INSERT INTO charging_points(id, location,price_eur_kwh) VALUES(?, ?, ?)",
@@ -181,10 +177,10 @@ async def consume_kafka():
                 insert_cp(cp_id, cp_location, kwh)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
             elif topic == "cp.status":
-                upsert_cp(cp_id, data.get("status"))
+                update_cp(cp_id, data.get("status"))
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
             elif topic == "cp.heartbeat":
-                upsert_cp(cp_id, "ACTIVADO")
+                update_cp(cp_id, "ACTIVADO")
                 await notify_panel({"type": "heartbeat", "cp_id": cp_id})
     finally:
         await kafka_consumer.stop()
