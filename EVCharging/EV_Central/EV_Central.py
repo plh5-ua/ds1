@@ -161,9 +161,11 @@ async def consume_kafka():
         "cp.heartbeat",
         "cp.status",
         "cp.register",
+        "driver.request",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
+
     await kafka_consumer.start()
     try:
         async for msg in kafka_consumer:
@@ -182,6 +184,38 @@ async def consume_kafka():
             elif topic == "cp.heartbeat":
                 update_cp(cp_id, "ACTIVADO")
                 await notify_panel({"type": "heartbeat", "cp_id": cp_id})
+            elif topic == "driver.request":
+                # data esperado: { "cp_id": "...", "driver_id": "...", "request_id": "..." }
+                # Asegura que el producer está listo (arrancan en paralelo)
+                while kafka_producer is None:
+                    await asyncio.sleep(0.05)
+
+                # 1) (opcional) validar CP en BD; por simplicidad, autorizamos siempre
+                # 2) Avisar al Engine (si está ejecutándose) para que empiece a cargar
+                await kafka_producer.send_and_wait(
+                    "central.authorize",
+                    json.dumps({
+                        "cp_id": data["cp_id"],
+                        "driver_id": data["driver_id"],
+                        "request_id": data["request_id"]
+                    }).encode()
+                )
+
+                # 3) Notificar al Driver
+                await kafka_producer.send_and_wait(
+                    "driver.update",
+                    json.dumps({
+                        "driver_id": data["driver_id"],
+                        "request_id": data["request_id"],
+                        "status": "AUTHORIZED",
+                        "message": f"Autorizado en {data['cp_id']}"
+                    }).encode()
+                )
+
+                print(f"[driver.request] {data}")
+                print(f"[central.authorize] -> {data['cp_id']}  | [driver.update] AUTHORIZED")
+
+
     finally:
         await kafka_consumer.stop()
 
