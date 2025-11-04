@@ -16,7 +16,7 @@ ENGINE_PORT = 6000  # puerto donde escucha al monitor
 # -------------------------------------------------------------
 CP_ID = None
 CP_LOCATION = "Desconocida"
-STATUS = "PARADO"
+STATUS = "Desconectado"
 PRICE = round(random.uniform(0.40, 0.70), 2)
 
 # -------------------------------------------------------------
