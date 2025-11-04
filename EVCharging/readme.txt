@@ -30,8 +30,8 @@ python EV_CP_E.py 192.168.56.1:9092
 EV_CP_E:
 cd /d D:\sd1\ds1\ds1\EVCharging\EV_CP_E
 python EV_CP_E.py 192.168.56.1:9092
+
 EV_CP_M:
 cd /d D:\sd1\ds1\ds1\EVCharging\EV_CP_M
-python EV_CP_M.py 192.168.56.1:6000 192.168.56.1:8080 CP-001
-
-
+python EV_CP_M.py 192.168.56.1:6000 192.168.56.1:8080 192.168.56.1:9092 12 calle_Serrano_13
+python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <ip_broker:puerto> <id_cp> <location>

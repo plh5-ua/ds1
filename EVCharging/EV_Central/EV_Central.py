@@ -69,7 +69,7 @@ def init_db():
         con.commit()
 
 
-def update_cp(cp_id: str, cp_location: str, status: str = None):
+def update_cp(cp_id: str, status: str = None):
     with closing(get_db()) as con:
         cur = con.cursor()
         row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
@@ -77,10 +77,11 @@ def update_cp(cp_id: str, cp_location: str, status: str = None):
             if status:
                 cur.execute(
                     "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, cp_id),
+                    (status, cp_id)
                 )
+                print(f"Updated{status}")
         else:
-            print(f"ERROR: no se ha podido actualizar el estado del CP")
+            print(f"ERROR: no hay un CP con ese id registrado, no se actualiza la base de datos.")
 
         con.commit()
 
@@ -92,7 +93,7 @@ def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
             print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
         else:
             cur.execute(
-                "INSERT INTO charging_points(id, location,price_eur_kwh) VALUES(?, ?, ?)",
+                "INSERT INTO charging_points(id, location, price_eur_kwh) VALUES(?, ?, ?)",
                 (cp_id, cp_location, kwh),
             )
         con.commit()
@@ -171,7 +172,7 @@ async def consume_kafka():
         async for msg in kafka_consumer:
             topic = msg.topic
             data = msg.value
-            cp_id = data.get("id")
+            cp_id = data.get("cp_id")
             cp_location = data.get("location")
             kwh = data.get("kwh")
             if topic == "cp.register":
@@ -183,6 +184,7 @@ async def consume_kafka():
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
             elif topic == "cp.heartbeat":
                 update_cp(cp_id, "ACTIVADO")
+                print(f"mi id: {cp_id}")
                 await notify_panel({"type": "heartbeat", "cp_id": cp_id})
             elif topic == "driver.request":
                 # data esperado: { "cp_id": "...", "driver_id": "...", "request_id": "..." }
