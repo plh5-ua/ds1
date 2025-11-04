@@ -170,7 +170,7 @@ async def consume_kafka():
         async for msg in kafka_consumer:
             topic = msg.topic
             data = msg.value
-            cp_id = data.get("id")
+            cp_id = data.get("cp_id")
             cp_location = data.get("location")
             kwh = data.get("kwh")
             if topic == "cp.register":

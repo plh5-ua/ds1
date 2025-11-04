@@ -16,34 +16,67 @@ ENGINE_PORT = 6000  # puerto donde escucha al monitor
 # -------------------------------------------------------------
 CP_ID = None
 CP_LOCATION = "Desconocida"
-STATUS = "Desconectado"
+STATUS = "DESCONECTADO"
 PRICE = round(random.uniform(0.40, 0.70), 2)
 
 # -------------------------------------------------------------
-# SOCKET: recibir ID desde el monitor
+# SOCKET: Servidor que escucha permanentemente al monitor
 # -------------------------------------------------------------
-def wait_for_id_location_from_monitor():
+async def socket_server(producer):
+    """Servidor TCP para recibir ID inicial, comandos y responder PING."""
+    global CP_ID, CP_LOCATION
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("0.0.0.0", ENGINE_PORT))
-    server.listen(1)
-    print(f"🕐 Esperando ID desde el monitor (puerto {ENGINE_PORT})...")
-    conn, addr = server.accept()
-    data = conn.recv(1024)
-    cp_info = json.loads(data.decode())
-    global CP_ID
-    global CP_LOCATION
-    CP_ID = cp_info.get("id")
-    CP_LOCATION = cp_info.get("location")
-    print(f"✅ ID recibido del monitor: {CP_ID} y location: {CP_LOCATION}")
-    conn.close()
-    server.close()
+    server.listen(5)
+    print(f"🕐 Escuchando conexiones del monitor en puerto {ENGINE_PORT}...")
+
+    while True:
+        conn, addr = server.accept()
+        data = conn.recv(1024)
+        if not data:
+            conn.close()
+            continue
+
+        try:
+            message = data.decode()
+            # Si el monitor manda "PING", responder OK
+            if message == "PING":
+                conn.sendall(b"OK")
+                conn.close()
+                continue
+
+            payload = json.loads(message)
+
+            # Registro inicial (ID y localización)
+            if "cp_id" in payload and "location" in payload:
+                CP_ID = payload["cp_id"]
+                CP_LOCATION = payload["location"]
+                print(f"✅ Recibido ID {CP_ID} y ubicación {CP_LOCATION}")
+                await register_cp(producer)
+                await send_status(producer, "ACTIVADO")
+
+            # Comandos del monitor
+            elif "action" in payload:
+                action = payload["action"].upper()
+                print(f"⚙️ Orden local recibida del monitor: {action}")
+                if action == "PARAR":
+                    await send_status(producer, "PARADO")
+                elif action == "ACTIVAR":
+                    await send_status(producer, "ACTIVADO")
+                elif action == "SUMINISTRAR":
+                    await start_charging(producer)
+
+        except Exception as e:
+            print(f"⚠️ Error procesando mensaje del monitor: {e}")
+        finally:
+            conn.close()
 
 # -------------------------------------------------------------
 # ENVÍO DE DATOS A CENTRAL (Kafka)
 # -------------------------------------------------------------
 async def register_cp(producer):
     msg = {
-        "id": CP_ID,
+        "cp_id": CP_ID,
         "location": CP_LOCATION,
         "kwh": PRICE,
         "status": STATUS
@@ -54,7 +87,7 @@ async def register_cp(producer):
 async def send_status(producer, status):
     global STATUS
     STATUS = status
-    payload = {"id": CP_ID, "status": status}
+    payload = {"cp_id": CP_ID, "status": status}
     await producer.send_and_wait("cp.status", json.dumps(payload).encode())
     print(f"📡 Estado actualizado: {status}")
 
@@ -63,14 +96,14 @@ async def start_charging(producer):
     STATUS = "SUMINISTRANDO"
     await send_status(producer, STATUS)
     kwh = 0
-
     print(f"⚡ Iniciando carga en {CP_ID} (Precio: {PRICE} €/kWh)")
+
     for _ in range(10):
         kw = round(random.uniform(6.0, 7.5), 2)
         kwh += kw / 3600
         amount = round(kwh * PRICE, 3)
         telem = {
-            "id": CP_ID,
+            "cp_id": CP_ID,
             "session_id": random.randint(1000, 9999),
             "kw": kw,
             "kwh_total": round(kwh, 3),
@@ -81,7 +114,7 @@ async def start_charging(producer):
         await asyncio.sleep(1)
 
     end_msg = {
-        "id": CP_ID,
+        "cp_id": CP_ID,
         "session_id": random.randint(1000, 9999),
         "kwh": round(kwh, 3),
         "amount_eur": round(kwh * PRICE, 2),
@@ -97,14 +130,14 @@ async def start_charging(producer):
 async def listen_to_central(consumer, producer):
     async for msg in consumer:
         data = msg.value
-        if data.get("id") != CP_ID:
+        if data.get("cp_id") != CP_ID:
             continue
         if msg.topic == "central.authorize":
             print("🔔 Autorizado suministro por CENTRAL")
             await start_charging(producer)
         elif msg.topic == "central.command":
             action = data["action"].upper()
-            print(f"⚙️ Orden recibida: {action}")
+            print(f"⚙️ Orden recibida desde CENTRAL: {action}")
             if action == "PARAR":
                 await send_status(producer, "PARADO")
             elif action == "REANUDAR":
@@ -114,10 +147,6 @@ async def listen_to_central(consumer, producer):
 # MAIN
 # -------------------------------------------------------------
 async def main():
-    # 1️⃣ Esperar ID desde el monitor (bloqueante)
-    wait_for_id_location_from_monitor()
-
-    # 2️⃣ Iniciar Kafka
     producer = AIOKafkaProducer(bootstrap_servers=BROKER)
     consumer = AIOKafkaConsumer(
         "central.authorize", "central.command",
@@ -127,15 +156,13 @@ async def main():
 
     await producer.start()
     await consumer.start()
-    print(f"🔌 EV_CP_E {CP_ID} conectado a Kafka {BROKER}")
-    print(f"📍 Precio: {PRICE} €/kWh")
+    print(f"🔌 EV_CP_E conectado a Kafka {BROKER}")
 
-    # 3️⃣ Registrar CP en CENTRAL
-    await register_cp(producer)
-    await send_status(producer, "ACTIVADO")
-
-    # 4️⃣ Escuchar CENTRAL
-    await listen_to_central(consumer, producer)
+    # Ejecutar socket server (local con el monitor) y escucha de CENTRAL en paralelo
+    await asyncio.gather(
+        socket_server(producer),
+        listen_to_central(consumer, producer)
+    )
 
     await consumer.stop()
     await producer.stop()
