@@ -22,8 +22,7 @@ PRICE = round(random.uniform(0.40, 0.70), 2)
 # -------------------------------------------------------------
 # SOCKET: recibir ID desde el monitor
 # -------------------------------------------------------------
-def wait_for_id_from_monitor():
-    global CP_ID
+def wait_for_id_location_from_monitor():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("0.0.0.0", ENGINE_PORT))
     server.listen(1)
@@ -31,8 +30,11 @@ def wait_for_id_from_monitor():
     conn, addr = server.accept()
     data = conn.recv(1024)
     cp_info = json.loads(data.decode())
-    CP_ID = cp_info.get("cp_id")
-    print(f"✅ ID recibido del monitor: {CP_ID}")
+    global CP_ID
+    global CP_LOCATION
+    CP_ID = cp_info.get("id")
+    CP_LOCATION = cp_info.get("location")
+    print(f"✅ ID recibido del monitor: {CP_ID} y location: {CP_LOCATION}")
     conn.close()
     server.close()
 
@@ -41,9 +43,9 @@ def wait_for_id_from_monitor():
 # -------------------------------------------------------------
 async def register_cp(producer):
     msg = {
-        "cp_id": CP_ID,
+        "id": CP_ID,
         "location": CP_LOCATION,
-        "price_eur_kwh": PRICE,
+        "kwh": PRICE,
         "status": STATUS
     }
     await producer.send_and_wait("cp.register", json.dumps(msg).encode())
@@ -52,7 +54,7 @@ async def register_cp(producer):
 async def send_status(producer, status):
     global STATUS
     STATUS = status
-    payload = {"cp_id": CP_ID, "status": status}
+    payload = {"id": CP_ID, "status": status}
     await producer.send_and_wait("cp.status", json.dumps(payload).encode())
     print(f"📡 Estado actualizado: {status}")
 
@@ -68,7 +70,7 @@ async def start_charging(producer):
         kwh += kw / 3600
         amount = round(kwh * PRICE, 3)
         telem = {
-            "cp_id": CP_ID,
+            "id": CP_ID,
             "session_id": random.randint(1000, 9999),
             "kw": kw,
             "kwh_total": round(kwh, 3),
@@ -79,7 +81,7 @@ async def start_charging(producer):
         await asyncio.sleep(1)
 
     end_msg = {
-        "cp_id": CP_ID,
+        "id": CP_ID,
         "session_id": random.randint(1000, 9999),
         "kwh": round(kwh, 3),
         "amount_eur": round(kwh * PRICE, 2),
@@ -95,7 +97,7 @@ async def start_charging(producer):
 async def listen_to_central(consumer, producer):
     async for msg in consumer:
         data = msg.value
-        if data.get("cp_id") != CP_ID:
+        if data.get("id") != CP_ID:
             continue
         if msg.topic == "central.authorize":
             print("🔔 Autorizado suministro por CENTRAL")
@@ -113,7 +115,7 @@ async def listen_to_central(consumer, producer):
 # -------------------------------------------------------------
 async def main():
     # 1️⃣ Esperar ID desde el monitor (bloqueante)
-    wait_for_id_from_monitor()
+    wait_for_id_location_from_monitor()
 
     # 2️⃣ Iniciar Kafka
     producer = AIOKafkaProducer(bootstrap_servers=BROKER)

@@ -77,10 +77,10 @@ def update_cp(cp_id: str, cp_location: str, status: str = None):
             if status:
                 cur.execute(
                     "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, cp_id),
+                    (status, cp_id)
                 )
         else:
-            print(f"ERROR: no se ha podido actualizar el estado del CP")
+            print(f"ERROR: no hay un CP con ese id registrado, no se actualiza la base de datos.")
 
         con.commit()
 
@@ -92,7 +92,7 @@ def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
             print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
         else:
             cur.execute(
-                "INSERT INTO charging_points(id, location,price_eur_kwh) VALUES(?, ?, ?)",
+                "INSERT INTO charging_points(id, location, price_eur_kwh) VALUES(?, ?, ?)",
                 (cp_id, cp_location, kwh),
             )
         con.commit()

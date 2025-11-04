@@ -2,13 +2,14 @@ import asyncio, json, sys, socket, random
 from aiokafka import AIOKafkaProducer
 
 if len(sys.argv) < 5:
-    print("Uso: python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <ip_broker:puerto> <id_cp>")
+    print("Uso: python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <ip_broker:puerto> <id_cp> <location>")
     sys.exit(1)
 
 ENGINE_ADDR = sys.argv[1]
 CENTRAL_ADDR = sys.argv[2]
 BROKER = sys.argv[3]
 CP_ID = sys.argv[4]
+LOCATION = sys.argv[5]
 
 ENGINE_IP, ENGINE_PORT = ENGINE_ADDR.split(":")
 ENGINE_PORT = int(ENGINE_PORT)
@@ -19,12 +20,12 @@ async def send_heartbeat(producer, health_flag):
     print(f"❤️‍🔥 Heartbeat {CP_ID} ({health_flag})")
 
 def send_id_to_engine():
-    """Envía el ID del CP al Engine por socket TCP."""
+    """Envía el ID y location del CP al Engine por socket TCP."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((ENGINE_IP, ENGINE_PORT))
-            s.sendall(json.dumps({"cp_id": CP_ID}).encode())
-            print(f"📨 ID {CP_ID} enviado al Engine ({ENGINE_IP}:{ENGINE_PORT})")
+            s.sendall(json.dumps({"id": CP_ID, "location": LOCATION.replace("_"," ")}).encode())
+            print(f"📨 ID {CP_ID} y location: {LOCATION.replace("_", " ")} enviado al Engine ({ENGINE_IP}:{ENGINE_PORT})")
     except ConnectionRefusedError:
         print("⚠️ No se pudo conectar con el Engine. ¿Está en ejecución?")
 
