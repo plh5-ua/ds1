@@ -15,7 +15,7 @@ ENGINE_IP, ENGINE_PORT = ENGINE_ADDR.split(":")
 ENGINE_PORT = int(ENGINE_PORT)
 
 async def send_heartbeat(producer, health_flag):
-    heartbeat = {"cp_id": CP_ID, "health": health_flag}
+    heartbeat = {"id": CP_ID, "health": health_flag}
     await producer.send_and_wait("cp.heartbeat", json.dumps(heartbeat).encode())
     print(f"❤️‍🔥 Heartbeat {CP_ID} ({health_flag})")
 

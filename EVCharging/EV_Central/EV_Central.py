@@ -182,6 +182,7 @@ async def consume_kafka():
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
             elif topic == "cp.heartbeat":
                 update_cp(cp_id, "ACTIVADO")
+                print(f"mi id: {cp_id}")
                 await notify_panel({"type": "heartbeat", "cp_id": cp_id})
     finally:
         await kafka_consumer.stop()

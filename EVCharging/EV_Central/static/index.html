@@ -1,16 +1,89 @@
-<!-- D:\sd1\ds1\ds1\EVCharging\EV_Central\static\index.html -->
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <title>Panel EV Central</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f5f5f5; color: #333; }
-        h1 { color: #0066cc; }
-    </style>
+  <meta charset="UTF-8">
+  <title>EV Central - Panel de Monitorización</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f5f5f5; color: #333; text-align: center; }
+    h1 { color: #007bff; }
+    table { margin: 20px auto; border-collapse: collapse; width: 80%; }
+    th, td { border: 1px solid #ccc; padding: 10px; }
+    th { background: #eee; }
+    .estado { font-weight: bold; color: white; border-radius: 4px; padding: 5px 10px; }
+    .ACTIVADO { background: #28a745; }
+    .SUMINISTRANDO { background: #007bff; }
+    .PARADO { background: orange; }
+    .DESCONECTADO { background: gray; }
+    .AVERIA { background: red; }
+  </style>
 </head>
 <body>
-    <h1>✅ EV_Central funcionando</h1>
-    <p>Servidor FastAPI y carpeta static listos.</p>
+  <h1>⚡ EV Central - Panel de Monitorización ⚡</h1>
+  <table id="cpTable">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Ubicación</th>
+        <th>Precio (€/kWh)</th>
+        <th>Estado</th>
+        <th>Última actualización</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <script>
+    const tableBody = document.querySelector("#cpTable tbody");
+
+    // Crear o actualizar fila en la tabla
+    function updateRow(cp) {
+      let row = document.getElementById(cp.id);
+      if (!row) {
+        row = document.createElement("tr");
+        row.id = cp.id;
+        row.innerHTML = `
+          <td>${cp.id}</td>
+          <td>${cp.location}</td>
+          <td>${cp.price_eur_kwh.toFixed(2)}</td>
+          <td class="estado ${cp.status}">${cp.status}</td>
+          <td>${new Date().toLocaleTimeString()}</td>
+        `;
+        tableBody.appendChild(row);
+      } else {
+        row.children[3].textContent = cp.status;
+        row.children[3].className = "estado " + cp.status;
+        row.children[4].textContent = new Date().toLocaleTimeString();
+      }
+    }
+
+    // Cargar puntos iniciales desde la API
+    async function loadCPs() {
+      const res = await fetch("/cp");
+      const data = await res.json();
+      data.forEach(updateRow);
+    }
+
+    // Conexión WebSocket para recibir eventos en tiempo real
+    function connectWebSocket() {
+      const ws = new WebSocket(`ws://${window.location.host}/ws`);
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        console.log("Evento recibido:", msg);
+        if (msg.cp_id && msg.status) {
+          updateRow({
+            id: msg.cp_id,
+            location: "Desconocida",
+            price_eur_kwh: 0.3,
+            status: msg.status
+          });
+        }
+      };
+      ws.onopen = () => console.log("✅ Conectado al panel WebSocket");
+      ws.onclose = () => console.log("❌ Desconectado del panel WebSocket");
+    }
+
+    loadCPs();
+    connectWebSocket();
+  </script>
 </body>
 </html>
