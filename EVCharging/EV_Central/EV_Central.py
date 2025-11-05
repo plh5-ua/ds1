@@ -73,12 +73,19 @@ def init_db():
 def insert_cp(cp_id: str, location: str, price: float = 0.3):
     with closing(get_db()) as con:
         cur = con.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO charging_points(id, location, price_eur_kwh) VALUES (?, ?, ?)",
-            (cp_id, location, price),
-        )
+        # Si existe, actualiza location y price
+        row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+        if row:
+            cur.execute(
+                "UPDATE charging_points SET location=?, price_eur_kwh=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (location, price, cp_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO charging_points(id, location, price_eur_kwh) VALUES (?, ?, ?)",
+                (cp_id, location, price),
+            )
         con.commit()
-
 
 def update_cp(cp_id: str, status: str):
     with closing(get_db()) as con:
@@ -95,6 +102,10 @@ def list_cps():
         rows = con.execute("SELECT * FROM charging_points").fetchall()
         return [dict(r) for r in rows]
 
+def get_cp_from_db(cp_id):
+    with closing(get_db()) as con:
+        row = con.execute("SELECT * FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+        return dict(row) if row else None
 
 # ---------------------------------------------------------------------------
 # FASTAPI + PANEL
@@ -159,26 +170,23 @@ def monitor_socket_server(loop):
             location = msg.get("location", "Desconocida")
 
             if action == "REGISTER":
-                insert_cp(cp_id, location)
+                insert_cp(cp_id, location, msg.get("price", 0.3))
+                cp_data = get_cp_from_db(cp_id)
                 print(f"🆕 CP registrado desde monitor: {cp_id} ({location})")
                 asyncio.run_coroutine_threadsafe(
-                    notify_panel(
-                        {"type": "register", "cp_id": cp_id, "status": "ACTIVADO"}
-                    ),
-                    loop,
+                    notify_panel({"type": "register", **cp_data}), loop,
                 )
 
             elif action == "HEARTBEAT":
                 health = msg.get("health", "KO")
                 new_status = "ACTIVADO" if health == "OK" else "AVERÍA"
                 update_cp(cp_id, new_status)
-                #print(f"❤️‍🔥 Heartbeat {cp_id}: {new_status}")
+                cp_data = get_cp_from_db(cp_id)
+                cp_data["status"] = new_status
                 asyncio.run_coroutine_threadsafe(
-                    notify_panel(
-                        {"type": "heartbeat", "cp_id": cp_id, "status": new_status}
-                    ),
-                    loop,
+                    notify_panel({"type": "heartbeat", **cp_data}), loop,
                 )
+
 
         except Exception as e:
             print(f"⚠️ Error procesando mensaje: {e}")
