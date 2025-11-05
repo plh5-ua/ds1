@@ -33,4 +33,4 @@ Thumbs.db
 
 # basedata+
 *.db
-evcentral.db
+EV_Central/evcentral.db
