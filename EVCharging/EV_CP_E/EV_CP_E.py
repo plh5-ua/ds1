@@ -203,6 +203,8 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
             # filtrar por CP correcto
             if CP_ID is None or data.get("cp_id") != CP_ID:
                 continue
+            # Dentro del handler que procesa mensajes de "central.authorize"
+            print(f"[{ENGINE_PORT}] authorize recibido:", data, "| CP_ID_local=", CP_ID)
 
             if msg.topic == "central.authorize":
                 print("🔔 Autorizado suministro por CENTRAL")
@@ -226,7 +228,7 @@ async def main():
         "central.authorize", "central.command",
         bootstrap_servers=BROKER,
         value_deserializer=lambda b: json.loads(b.decode()),
-        group_id="engine-consumers",
+        group_id=f"engine-{ENGINE_PORT}",
         auto_offset_reset="latest"
     )
 
