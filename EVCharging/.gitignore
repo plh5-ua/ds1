@@ -30,3 +30,7 @@ Thumbs.db
 # Variables de entorno / secretos
 .env
 .env.*
+
+# basedata+
+*.db
+evcentral.db
