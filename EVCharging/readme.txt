@@ -3,6 +3,14 @@ instalacion:
 # librerias
 pip install fastapi uvicorn aiokafka pydantic websockets
 
+#=================
+# con esto creamos un entorno limpio con el que podemos asegurarnos que todas las versiones correponden:
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+set PYTHONNOUSERSITE=1
+pip install --no-cache-dir -r requirements.txt
+#=================
+
 #BASEDATA
 En la carpetanEVCentral hacer desde una terminal 
 mi pc:

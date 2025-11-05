@@ -1,24 +1,24 @@
 """
 EV_Central — Sistema central de monitorización de puntos de recarga
 Uso:
-    python central.py <puerto_http> <ip_broker:puerto> [<ip_db:puerto>]
+    python EV_Central.py <puerto_http> <ip_broker:puerto>
 
 Ejemplo:
-    python central.py 8080 127.0.0.1:9092 127.0.0.1:0
+    python EV_Central.py 8080 127.0.0.1:9092
 """
 
 import sys
-import os
 import json
 import asyncio
 import sqlite3
+import threading
+import socket
 from contextlib import closing
 from typing import Dict, Any
 
 # --- FastAPI / WebSocket ---
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 import uvicorn
 
 # --- Kafka asíncrono ---
@@ -29,20 +29,21 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 # ARGUMENTOS DE EJECUCIÓN
 # ---------------------------------------------------------------------------
 
-if len(sys.argv) < 3:
-    print("Uso: python central.py <puerto_http> <ip_broker:puerto> [<ip_db:puerto>]")
+if len(sys.argv) < 2:
+    print("Uso: python EV_Central.py <puerto_http> <ip_broker:puerto>")
     sys.exit(1)
 
 HTTP_PORT = int(sys.argv[1])
-KAFKA_BOOTSTRAP = sys.argv[2]
-DB_ADDR = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1:0"  # no se usa en SQLite
+KAFKA_BOOTSTRAP = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:9092"
+SOCKET_PORT = 9000  # puerto para monitores
 
 print("🔌 Iniciando EV_Central ...")
 print(f"  • Puerto HTTP: {HTTP_PORT}")
 print(f"  • Broker Kafka: {KAFKA_BOOTSTRAP}")
-print(f"  • Dirección BBDD: {DB_ADDR}")
+print(f"  • Puerto SOCKET monitores: {SOCKET_PORT}")
 
 DB_PATH = "evcentral.db"
+
 
 # ---------------------------------------------------------------------------
 # BASE DE DATOS SQLITE
@@ -55,6 +56,7 @@ def get_db():
 
 
 def init_db():
+    # Usa el schema.sql con tablas: charging_points, sessions, events
     with open("schema.sql", "r", encoding="utf-8") as f:
         schema = f.read()
     with closing(get_db()) as con:
@@ -62,40 +64,44 @@ def init_db():
         con.commit()
 
 
-
-def update_cp(cp_id: str, status: str = None):
+def insert_cp(cp_id: str, location: str, price: float = 0.3):
+    """Upsert: si existe actualiza location/price; si no, inserta."""
     with closing(get_db()) as con:
         cur = con.cursor()
         row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
         if row:
-            if status:
-                cur.execute(
-                    "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, cp_id)
-                )
-                print(f"Updated {status}")
-        else:
-            print(f"ERROR: no hay un CP con ese id registrado, no se actualiza la base de datos.")
-
-        con.commit()
-
-def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
-    with closing(get_db()) as con:
-        cur = con.cursor()
-        row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
-        if row:
-            print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
+            cur.execute(
+                "UPDATE charging_points SET location=?, price_eur_kwh=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (location, price, cp_id),
+            )
         else:
             cur.execute(
-                "INSERT INTO charging_points(id, location, price_eur_kwh) VALUES(?, ?, ?)",
-                (cp_id, cp_location, kwh),
+                "INSERT INTO charging_points(id, location, price_eur_kwh) VALUES (?, ?, ?)",
+                (cp_id, location, price),
             )
         con.commit()
+
+
+def update_cp(cp_id: str, status: str):
+    with closing(get_db()) as con:
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (status, cp_id),
+        )
+        con.commit()
+
 
 def list_cps():
     with closing(get_db()) as con:
         rows = con.execute("SELECT * FROM charging_points").fetchall()
         return [dict(r) for r in rows]
+
+
+def get_cp_from_db(cp_id):
+    with closing(get_db()) as con:
+        row = con.execute("SELECT * FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+        return dict(row) if row else None
 
 
 def db_get_cp(con, cp_id):
@@ -104,6 +110,7 @@ def db_get_cp(con, cp_id):
         (cp_id,)
     ).fetchone()
 
+
 def log_event(cp_id, driver_id, etype, payload):
     with closing(get_db()) as con:
         con.execute(
@@ -111,6 +118,7 @@ def log_event(cp_id, driver_id, etype, payload):
             (cp_id, driver_id, etype, json.dumps(payload))
         )
         con.commit()
+
 
 def start_session(cp_id, driver_id, price_eur_kwh):
     with closing(get_db()) as con:
@@ -123,6 +131,7 @@ def start_session(cp_id, driver_id, price_eur_kwh):
         con.commit()
         return sid
 
+
 def update_session_progress(session_id, kwh, amount_eur):
     with closing(get_db()) as con:
         con.execute(
@@ -130,6 +139,7 @@ def update_session_progress(session_id, kwh, amount_eur):
             (kwh, amount_eur, session_id)
         )
         con.commit()
+
 
 def end_session(session_id, kwh, amount_eur, ended_status="ENDED"):
     with closing(get_db()) as con:
@@ -147,19 +157,13 @@ def end_session(session_id, kwh, amount_eur, ended_status="ENDED"):
 app = FastAPI(title="EV_Central")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-class DriverRequest(BaseModel):
-    cp_id: str
-    driver_id: str
-    request_id: str
+PANEL_CLIENTS = set()
 
 
 @app.get("/cp")
 def api_list_cps():
     return list_cps()
 
-
-# --- WebSocket para el panel ---
-PANEL_CLIENTS = set()
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -168,7 +172,7 @@ async def websocket_endpoint(ws: WebSocket):
     print("📡 Cliente conectado al panel")
     try:
         while True:
-            await ws.receive_text()  # solo mantener viva la conexión
+            await ws.receive_text()
     except WebSocketDisconnect:
         PANEL_CLIENTS.discard(ws)
         print("🔌 Cliente desconectado")
@@ -186,13 +190,99 @@ async def notify_panel(event: Dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
-# KAFKA (PRODUCER + CONSUMER)
+# SOCKET SERVER (para MONITORES)
+# ---------------------------------------------------------------------------
+
+def monitor_socket_server(loop):
+    """
+    Recibe registros y heartbeats desde los monitores vía socket (bloqueante en hilo).
+    Protocolo:
+       - REGISTER: { "action": "REGISTER", "cp_id": "...", "location": "...", "price": 0.58 }
+         → inserta/actualiza en BD, notifica panel
+       - HEARTBEAT: { "action": "HEARTBEAT", "cp_id": "...", "health": "OK"/"KO" }
+         → actualiza estado a ACTIVADO/AVERIA, notifica panel
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("0.0.0.0", SOCKET_PORT))
+    srv.listen(8)
+    print(f"🧭 Escuchando monitores en puerto {SOCKET_PORT}...")
+
+    while True:
+        conn, _addr = srv.accept()
+        try:
+            data = conn.recv(4096)
+            if not data:
+                conn.close()
+                continue
+
+            try:
+                msg = json.loads(data.decode())
+            except Exception:
+                # compat: si el monitor envía texto plano “PING”
+                if data == b"PING":
+                    conn.sendall(b"OK")
+                else:
+                    conn.sendall(b"NACK")
+                conn.close()
+                continue
+
+            action = (msg.get("action") or "").upper()
+            cp_id = msg.get("cp_id")
+
+            if action == "REGISTER":
+                location = msg.get("location", "Desconocida")
+                price = float(msg.get("price", 0.30))
+                insert_cp(cp_id, location, price)
+                cp_data = get_cp_from_db(cp_id)
+                print(f"🆕 CP registrado desde monitor: {cp_id} ({location}, {price} €/kWh)")
+                # ACK al monitor si lo espera
+                try:
+                    conn.sendall(b"ACK")
+                except Exception:
+                    pass
+                asyncio.run_coroutine_threadsafe(
+                    notify_panel({"type": "register", **cp_data}), loop,
+                )
+
+            elif action == "HEARTBEAT":
+                health = (msg.get("health") or "KO").upper()
+                new_status = "ACTIVADO" if health == "OK" else "AVERIA"
+                update_cp(cp_id, new_status)
+                cp_data = get_cp_from_db(cp_id) or {"id": cp_id, "status": new_status}
+                cp_data["status"] = new_status
+                asyncio.run_coroutine_threadsafe(
+                    notify_panel({"type": "heartbeat", **cp_data}), loop,
+                )
+                try:
+                    conn.sendall(health.encode())
+                except Exception:
+                    pass
+
+            else:
+                try:
+                    conn.sendall(b"NACK")
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"⚠️ Error procesando monitor: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# KAFKA (Engines y Drivers)
 # ---------------------------------------------------------------------------
 
 kafka_consumer = None
 kafka_producer = None
+
 # Sesiones activas por CP (mapeo en memoria)
-ACTIVE_SESSIONS = {}  # cp_id -> {"driver_id":..., "request_id":...}
+# cp_id -> {"driver_id":..., "request_id":..., "session_id":...}
+ACTIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 async def consume_kafka():
@@ -206,37 +296,44 @@ async def consume_kafka():
         "driver.request",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+        auto_offset_reset="latest",
+        group_id="central-consumer",
     )
-
     await kafka_consumer.start()
+
+    # Espera a que producer esté listo
+    global kafka_producer
+    while kafka_producer is None:
+        await asyncio.sleep(0.05)
+
     try:
         async for msg in kafka_consumer:
             topic = msg.topic
             data = msg.value
             cp_id = data.get("cp_id")
-            cp_location = data.get("location")
-            kwh = data.get("kwh")
+
             if topic == "cp.register":
-                print(f"Iniciando registro de CP {cp_id}")
-                insert_cp(cp_id, cp_location, kwh)
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
+                # Registro de Engine (vía Kafka) — redundante con monitor, pero compatible
+                insert_cp(cp_id, data.get("location", "Desconocida"), float(data.get("kwh", 0.30)))
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
+
             elif topic == "cp.status":
-                update_cp(cp_id, data.get("status"))
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
+                update_cp(cp_id, data.get("status", "ACTIVADO"))
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
+
             elif topic == "cp.heartbeat":
-                health = data.get("health")
+                # Si un Engine publica health por Kafka (además del monitor)
+                health = (data.get("health") or "OK").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
                 update_cp(cp_id, new_status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
                 log_event(cp_id, None, "HEARTBEAT", {"health": health})
-            elif topic == "driver.request":
-                while kafka_producer is None:
-                    await asyncio.sleep(0.05)
 
+            elif topic == "driver.request":
                 req_cp = data["cp_id"]; req_driver = data["driver_id"]; req_id = data["request_id"]
                 print(f"[driver.request] {data}")
 
-                # ocupado
+                # 1) ¿Ocupado?
                 if req_cp in ACTIVE_SESSIONS:
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
                         "driver_id": req_driver, "request_id": req_id,
@@ -244,29 +341,35 @@ async def consume_kafka():
                     }).encode())
                     continue
 
-                # validar en BD
+                # 2) ¿Existe y estado?
                 with closing(get_db()) as con:
                     row = db_get_cp(con, req_cp)
                 if not row:
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
                         "driver_id": req_driver, "request_id": req_id,
                         "status": "DENIED", "message": f"CP {req_cp} no registrado en CENTRAL"
-                    }).encode()); continue
+                    }).encode())
+                    continue
 
                 cp_status = row["status"]
-                if cp_status in ("DESCONECTADO", "AVERIA", "PARADO") or cp_status != "ACTIVADO":
+                if cp_status != "ACTIVADO":
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
                         "driver_id": req_driver, "request_id": req_id,
                         "status": "DENIED", "message": f"CP {req_cp} no disponible (estado {cp_status})"
-                    }).encode()); continue
+                    }).encode())
+                    continue
 
-                # sesión RUNNING
+                # 3) Crear sesión RUNNING
                 price = row["price_eur_kwh"]
                 session_id = start_session(req_cp, req_driver, price)
-                ACTIVE_SESSIONS[req_cp] = {"driver_id": req_driver, "request_id": req_id, "session_id": session_id}
+                ACTIVE_SESSIONS[req_cp] = {
+                    "driver_id": req_driver,
+                    "request_id": req_id,
+                    "session_id": session_id
+                }
                 log_event(req_cp, req_driver, "AUTH", {"request_id": req_id})
 
-                # avisar al engine + driver
+                # 4) Avisar a Engine y Driver
                 await kafka_producer.send_and_wait("central.authorize", json.dumps({
                     "cp_id": req_cp, "driver_id": req_driver, "request_id": req_id
                 }).encode())
@@ -274,38 +377,48 @@ async def consume_kafka():
                     "driver_id": req_driver, "request_id": req_id,
                     "status": "AUTHORIZED", "message": f"Autorizado en {req_cp}"
                 }).encode())
-
                 print(f"[central.authorize] -> {req_cp}  | [driver.update] AUTHORIZED")
-
 
             elif topic == "cp.telemetry":
                 sess = ACTIVE_SESSIONS.get(cp_id)
                 if not sess:
+                    # Telemetría de una sesión que CENTRAL no abrió
                     continue
-                update_session_progress(sess["session_id"], data.get("kwh_total", 0), data.get("eur_total", 0))
+                update_session_progress(sess["session_id"], data.get("kwh_total", 0.0), data.get("eur_total", 0.0))
                 log_event(cp_id, sess["driver_id"], "TELEMETRY", data)
+                # reenviar al Driver dueño de la request
                 await kafka_producer.send_and_wait("driver.telemetry", json.dumps({
-                    "driver_id": sess["driver_id"], "request_id": sess["request_id"], "cp_id": cp_id,
-                    "kw": data.get("kw"), "kwh_total": data.get("kwh_total"), "eur_total": data.get("eur_total")
+                    "driver_id": sess["driver_id"],
+                    "request_id": sess["request_id"],
+                    "cp_id": cp_id,
+                    "kw": data.get("kw"),
+                    "kwh_total": data.get("kwh_total"),
+                    "eur_total": data.get("eur_total")
                 }).encode())
 
             elif topic == "cp.session_ended":
                 sess = ACTIVE_SESSIONS.pop(cp_id, None)
-                summary = {"kwh": data.get("kwh"), "amount_eur": data.get("amount_eur"), "reason": data.get("reason", "ENDED")}
+                summary = {
+                    "kwh": data.get("kwh"),
+                    "amount_eur": data.get("amount_eur"),
+                    "reason": data.get("reason", "ENDED")
+                }
+
+                # Liberar CP y notificar panel
                 update_cp(cp_id, "ACTIVADO")
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
+
                 if sess:
                     end_session(sess["session_id"], summary["kwh"], summary["amount_eur"],
                                 "ENDED" if summary["reason"] == "ENDED" else "ABORTED")
                     log_event(cp_id, sess["driver_id"], "END", summary)
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
-                        "driver_id": sess["driver_id"], "request_id": sess["request_id"],
-                        "status": "FINISHED", "message": f"Servicio finalizado en {cp_id}", "summary": summary
+                        "driver_id": sess["driver_id"],
+                        "request_id": sess["request_id"],
+                        "status": "FINISHED",
+                        "message": f"Servicio finalizado en {cp_id}",
+                        "summary": summary
                     }).encode())
-
-
-
-
 
     finally:
         await kafka_consumer.stop()
@@ -318,16 +431,21 @@ async def produce_kafka():
 
 
 # ---------------------------------------------------------------------------
-# ARRANQUE PRINCIPAL
+# MAIN
 # ---------------------------------------------------------------------------
 
 async def main():
     init_db()
-    # lanzar tareas Kafka
-    asyncio.create_task(consume_kafka())
-    asyncio.create_task(produce_kafka())
 
-    # lanzar servidor HTTP FastAPI
+    # Hilo para servidor de monitores (socket bloqueante)
+    loop = asyncio.get_running_loop()
+    threading.Thread(target=monitor_socket_server, args=(loop,), daemon=True).start()
+
+    # Kafka
+    asyncio.create_task(produce_kafka())
+    asyncio.create_task(consume_kafka())
+
+    # HTTP + WS del panel
     config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
