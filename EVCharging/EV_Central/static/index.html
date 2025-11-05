@@ -69,11 +69,11 @@
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         console.log("Evento recibido:", msg);
-        if (msg.cp_id && msg.status) {
+        if ((msg.id || msg.cp_id) && msg.status) {
           updateRow({
-            id: msg.cp_id,
-            location: "Desconocida",
-            price_eur_kwh: 0.3,
+            id: msg.id || msg.cp_id,
+            location: msg.location || "Desconocida",
+            price_eur_kwh: msg.price_eur_kwh || 0.3,
             status: msg.status
           });
         }

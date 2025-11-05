@@ -1,15 +1,15 @@
-import asyncio, json, sys, random, socket
+import asyncio, json, sys, random, socket, threading
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 # -------------------------------------------------------------
 # ARGUMENTOS
 # -------------------------------------------------------------
-if len(sys.argv) < 2:
-    print("Uso: python EV_CP_E.py <broker_ip:puerto>")
+if len(sys.argv) < 3:
+    print("Uso: python EV_CP_E.py <broker_ip:puerto> <puerto_engine>")
     sys.exit(1)
 
 BROKER = sys.argv[1]
-ENGINE_PORT = 6000  # puerto donde escucha al monitor
+ENGINE_PORT = int(sys.argv[2])
 
 # -------------------------------------------------------------
 # VARIABLES GLOBALES
@@ -18,17 +18,32 @@ CP_ID = None
 CP_LOCATION = "Desconocida"
 STATUS = "DESCONECTADO"
 PRICE = round(random.uniform(0.40, 0.70), 2)
+HEALTH = "OK"
 
 # -------------------------------------------------------------
-# SOCKET: Servidor que escucha permanentemente al monitor
+# CONTROL DESDE TECLADO (para simular KO/OK)
 # -------------------------------------------------------------
-async def socket_server(producer):
-    """Servidor TCP para recibir ID inicial, comandos y responder PING."""
+def control_thread():
+    global HEALTH
+    while True:
+        cmd = input("").strip().upper()
+        if cmd == "KO":
+            HEALTH = "KO"
+            print("⚠️ Engine simulado en estado KO.")
+        elif cmd == "OK":
+            HEALTH = "OK"
+            print("✅ Engine vuelve a estado OK.")
+
+# -------------------------------------------------------------
+# SOCKET SERVER (comunicación con Monitor)
+# -------------------------------------------------------------
+async def socket_server():
+    """Recibe registro e instrucciones desde el Monitor."""
     global CP_ID, CP_LOCATION
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("0.0.0.0", ENGINE_PORT))
     server.listen(5)
-    print(f"🕐 Escuchando conexiones del monitor en puerto {ENGINE_PORT}...")
+    print(f"🕐 Escuchando al monitor en puerto {ENGINE_PORT}...")
 
     while True:
         conn, addr = server.accept()
@@ -37,53 +52,28 @@ async def socket_server(producer):
             conn.close()
             continue
 
+        msg = data.decode().strip()
+        # Heartbeat del monitor
+        if msg == "HEARTBEAT":
+            conn.sendall(HEALTH.encode())
+            conn.close()
+            continue
+
+        # Mensaje de registro inicial
         try:
-            message = data.decode()
-            # Si el monitor manda "PING", responder OK
-            if message == "PING":
-                conn.sendall(b"OK")
-                conn.close()
-                continue
-
-            payload = json.loads(message)
-
-            # Registro inicial (ID y localización)
+            payload = json.loads(msg)
             if "cp_id" in payload and "location" in payload:
                 CP_ID = payload["cp_id"]
                 CP_LOCATION = payload["location"]
-                print(f"✅ Recibido ID {CP_ID} y ubicación {CP_LOCATION}")
-                await register_cp(producer)
-                await send_status(producer, "ACTIVADO")
-
-            # Comandos del monitor
-            elif "action" in payload:
-                action = payload["action"].upper()
-                print(f"⚙️ Orden local recibida del monitor: {action}")
-                if action == "PARAR":
-                    await send_status(producer, "PARADO")
-                elif action == "ACTIVAR":
-                    await send_status(producer, "ACTIVADO")
-                elif action == "SUMINISTRAR":
-                    await start_charging(producer)
-
+                conn.sendall(b"ACK")
+                print(f"✅ Recibido ID {CP_ID} ({CP_LOCATION}) del monitor")
         except Exception as e:
-            print(f"⚠️ Error procesando mensaje del monitor: {e}")
-        finally:
-            conn.close()
+            print(f"⚠️ Error procesando mensaje: {e}")
+        conn.close()
 
 # -------------------------------------------------------------
-# ENVÍO DE DATOS A CENTRAL (Kafka)
+# KAFKA (comunicación con CENTRAL)
 # -------------------------------------------------------------
-async def register_cp(producer):
-    msg = {
-        "cp_id": CP_ID,
-        "location": CP_LOCATION,
-        "kwh": PRICE,
-        "status": STATUS
-    }
-    await producer.send_and_wait("cp.register", json.dumps(msg).encode())
-    print(f"📡 Registrando CP {CP_ID} en CENTRAL ({CP_LOCATION}) - {PRICE} €/kWh")
-
 async def send_status(producer, status):
     global STATUS
     STATUS = status
@@ -124,54 +114,55 @@ async def start_charging(producer):
     await send_status(producer, "ACTIVADO")
     print("✅ Carga finalizada.")
 
-# -------------------------------------------------------------
-# ESCUCHAR A CENTRAL (Kafka)
-# -------------------------------------------------------------
-async def listen_to_central(consumer, producer):
-    async for msg in consumer:
-        data = msg.value
-        if data.get("cp_id") != CP_ID:
-            continue
-        if msg.topic == "central.authorize":
-            print("🔔 Autorizado suministro por CENTRAL")
-            await start_charging(producer)
-        elif msg.topic == "central.command":
-            action = data["action"].upper()
-            print(f"⚙️ Orden recibida desde CENTRAL: {action}")
-            if action == "PARAR":
-                await send_status(producer, "PARADO")
-            elif action == "REANUDAR":
-                await send_status(producer, "ACTIVADO")
+async def listen_to_central(producer):
+    consumer = AIOKafkaConsumer(
+        "central.authorize", "central.command",
+        bootstrap_servers=BROKER,
+        value_deserializer=lambda b: json.loads(b.decode())
+    )
+    await consumer.start()
+    print(f"📡 Escuchando mensajes de CENTRAL para {ENGINE_PORT}...")
+
+    try:
+        async for msg in consumer:
+            data = msg.value
+            if data.get("cp_id") != CP_ID:
+                continue
+            if msg.topic == "central.authorize":
+                print("🔔 Autorizado suministro por CENTRAL")
+                await start_charging(producer)
+            elif msg.topic == "central.command":
+                action = data["action"].upper()
+                print(f"⚙️ Orden desde CENTRAL: {action}")
+                if action == "PARAR":
+                    await send_status(producer, "PARADO")
+                elif action == "REANUDAR":
+                    await send_status(producer, "ACTIVADO")
+    finally:
+        await consumer.stop()
 
 # -------------------------------------------------------------
 # MAIN
 # -------------------------------------------------------------
 async def main():
     producer = AIOKafkaProducer(bootstrap_servers=BROKER)
-    consumer = AIOKafkaConsumer(
-        "central.authorize", "central.command",
-        bootstrap_servers=BROKER,
-        value_deserializer=lambda b: json.loads(b.decode())
-    )
-
     await producer.start()
-    await consumer.start()
-    print(f"🔌 EV_CP_E conectado a Kafka {BROKER}")
 
-    # Ejecutar socket server (local con el monitor) y escucha de CENTRAL en paralelo
+    threading.Thread(target=control_thread, daemon=True).start()
+
+    print(f"🔌 EV_CP_E (Engine) ejecutándose en puerto {ENGINE_PORT}")
+    print(f"⌨️ Escribe 'KO' o 'OK' para simular fallos en este Engine.\n")
+
     await asyncio.gather(
-        socket_server(producer),
-        listen_to_central(consumer, producer)
+        socket_server(),
+        listen_to_central(producer)
     )
 
-    await consumer.stop()
     await producer.stop()
 
-# -------------------------------------------------------------
-# EJECUCIÓN
-# -------------------------------------------------------------
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🔴 Programa detenido por el usuario.")
+        print(f"\n🔴 Engine en puerto {ENGINE_PORT} detenido por el usuario.")

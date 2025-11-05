@@ -1,24 +1,24 @@
 """
 EV_Central — Sistema central de monitorización de puntos de recarga
 Uso:
-    python central.py <puerto_http> <ip_broker:puerto> [<ip_db:puerto>]
+    python EV_Central.py <puerto_http> <ip_broker:puerto>
 
 Ejemplo:
-    python central.py 8080 127.0.0.1:9092 127.0.0.1:0
+    python EV_Central.py 8080 127.0.0.1:9092
 """
 
 import sys
-import os
 import json
 import asyncio
 import sqlite3
+import threading
+import socket
 from contextlib import closing
 from typing import Dict, Any
 
 # --- FastAPI / WebSocket ---
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 import uvicorn
 
 # --- Kafka asíncrono ---
@@ -30,19 +30,20 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 # ---------------------------------------------------------------------------
 
 if len(sys.argv) < 3:
-    print("Uso: python central.py <puerto_http> <ip_broker:puerto> [<ip_db:puerto>]")
+    print("Uso: python EV_Central.py <puerto_http> <ip_broker:puerto>")
     sys.exit(1)
 
 HTTP_PORT = int(sys.argv[1])
 KAFKA_BOOTSTRAP = sys.argv[2]
-DB_ADDR = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1:0"  # no se usa en SQLite
+SOCKET_PORT = 9000  # puerto para monitores
 
 print("🔌 Iniciando EV_Central ...")
 print(f"  • Puerto HTTP: {HTTP_PORT}")
 print(f"  • Broker Kafka: {KAFKA_BOOTSTRAP}")
-print(f"  • Dirección BBDD: {DB_ADDR}")
+print(f"  • Puerto SOCKET monitores: {SOCKET_PORT}")
 
 DB_PATH = "evcentral.db"
+
 
 # ---------------------------------------------------------------------------
 # BASE DE DATOS SQLITE
@@ -69,34 +70,25 @@ def init_db():
         con.commit()
 
 
-def update_cp(cp_id: str, status: str = None):
+def insert_cp(cp_id: str, location: str, price: float = 0.3):
     with closing(get_db()) as con:
         cur = con.cursor()
-        row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
-        if row:
-            if status:
-                cur.execute(
-                    "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (status, cp_id)
-                )
-                print(f"Updated{status}")
-        else:
-            print(f"ERROR: no hay un CP con ese id registrado, no se actualiza la base de datos.")
-
+        cur.execute(
+            "INSERT OR IGNORE INTO charging_points(id, location, price_eur_kwh) VALUES (?, ?, ?)",
+            (cp_id, location, price),
+        )
         con.commit()
 
-def insert_cp(cp_id: str, cp_location: str, kwh: float, status: str = None):
+
+def update_cp(cp_id: str, status: str):
     with closing(get_db()) as con:
         cur = con.cursor()
-        row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
-        if row:
-            print(f"ERROR: no se puede crear dos puntos de carga con el mismo id")
-        else:
-            cur.execute(
-                "INSERT INTO charging_points(id, location, price_eur_kwh) VALUES(?, ?, ?)",
-                (cp_id, cp_location, kwh),
-            )
+        cur.execute(
+            "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (status, cp_id),
+        )
         con.commit()
+
 
 def list_cps():
     with closing(get_db()) as con:
@@ -111,19 +103,13 @@ def list_cps():
 app = FastAPI(title="EV_Central")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-class DriverRequest(BaseModel):
-    cp_id: str
-    driver_id: str
-    request_id: str
+PANEL_CLIENTS = set()
 
 
 @app.get("/cp")
 def api_list_cps():
     return list_cps()
 
-
-# --- WebSocket para el panel ---
-PANEL_CLIENTS = set()
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -132,7 +118,7 @@ async def websocket_endpoint(ws: WebSocket):
     print("📡 Cliente conectado al panel")
     try:
         while True:
-            await ws.receive_text()  # solo mantener viva la conexión
+            await ws.receive_text()
     except WebSocketDisconnect:
         PANEL_CLIENTS.discard(ws)
         print("🔌 Cliente desconectado")
@@ -150,76 +136,103 @@ async def notify_panel(event: Dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
-# KAFKA (PRODUCER + CONSUMER)
+# SOCKET SERVER (para MONITORES)
 # ---------------------------------------------------------------------------
 
-kafka_consumer = None
+def monitor_socket_server(loop):
+    """Recibe registros y heartbeats desde los monitores vía socket."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("0.0.0.0", SOCKET_PORT))
+    srv.listen(5)
+    print(f"🧭 Escuchando monitores en puerto {SOCKET_PORT}...")
+
+    while True:
+        conn, addr = srv.accept()
+        data = conn.recv(1024)
+        if not data:
+            conn.close()
+            continue
+        try:
+            msg = json.loads(data.decode())
+            action = msg.get("action")
+            cp_id = msg.get("cp_id")
+            location = msg.get("location", "Desconocida")
+
+            if action == "REGISTER":
+                insert_cp(cp_id, location)
+                print(f"🆕 CP registrado desde monitor: {cp_id} ({location})")
+                asyncio.run_coroutine_threadsafe(
+                    notify_panel(
+                        {"type": "register", "cp_id": cp_id, "status": "ACTIVADO"}
+                    ),
+                    loop,
+                )
+
+            elif action == "HEARTBEAT":
+                health = msg.get("health", "KO")
+                new_status = "ACTIVADO" if health == "OK" else "AVERÍA"
+                update_cp(cp_id, new_status)
+                #print(f"❤️‍🔥 Heartbeat {cp_id}: {new_status}")
+                asyncio.run_coroutine_threadsafe(
+                    notify_panel(
+                        {"type": "heartbeat", "cp_id": cp_id, "status": new_status}
+                    ),
+                    loop,
+                )
+
+        except Exception as e:
+            print(f"⚠️ Error procesando mensaje: {e}")
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# KAFKA (solo para Engines y Drivers)
+# ---------------------------------------------------------------------------
+
 kafka_producer = None
 
+
 async def consume_kafka():
-    global kafka_consumer
-    kafka_consumer = AIOKafkaConsumer(
-        "cp.heartbeat",
-        "cp.status",
-        "cp.register",
+    consumer = AIOKafkaConsumer(
         "driver.request",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
+    await consumer.start()
 
-    await kafka_consumer.start()
+    global kafka_producer
+    while kafka_producer is None:
+        await asyncio.sleep(0.1)
+
     try:
-        async for msg in kafka_consumer:
-            topic = msg.topic
+        async for msg in consumer:
             data = msg.value
             cp_id = data.get("cp_id")
-            cp_location = data.get("location")
-            kwh = data.get("kwh")
-            if topic == "cp.register":
-                print(f"Iniciando registro de CP {cp_id}")
-                insert_cp(cp_id, cp_location, kwh)
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
-            elif topic == "cp.status":
-                update_cp(cp_id, data.get("status"))
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
-            elif topic == "cp.heartbeat":
-                update_cp(cp_id, "ACTIVADO")
-                print(f"mi id: {cp_id}")
-                await notify_panel({"type": "heartbeat", "cp_id": cp_id})
-            elif topic == "driver.request":
-                # data esperado: { "cp_id": "...", "driver_id": "...", "request_id": "..." }
-                # Asegura que el producer está listo (arrancan en paralelo)
-                while kafka_producer is None:
-                    await asyncio.sleep(0.05)
+            driver_id = data.get("driver_id")
+            request_id = data.get("request_id")
 
-                # 1) (opcional) validar CP en BD; por simplicidad, autorizamos siempre
-                # 2) Avisar al Engine (si está ejecutándose) para que empiece a cargar
-                await kafka_producer.send_and_wait(
-                    "central.authorize",
-                    json.dumps({
-                        "cp_id": data["cp_id"],
-                        "driver_id": data["driver_id"],
-                        "request_id": data["request_id"]
-                    }).encode()
-                )
-
-                # 3) Notificar al Driver
-                await kafka_producer.send_and_wait(
-                    "driver.update",
-                    json.dumps({
-                        "driver_id": data["driver_id"],
-                        "request_id": data["request_id"],
+            # Enviar autorización al Engine correspondiente
+            await kafka_producer.send_and_wait(
+                "central.authorize",
+                json.dumps(
+                    {"cp_id": cp_id, "driver_id": driver_id, "request_id": request_id}
+                ).encode(),
+            )
+            # Notificar al Driver
+            await kafka_producer.send_and_wait(
+                "driver.update",
+                json.dumps(
+                    {
+                        "driver_id": driver_id,
+                        "request_id": request_id,
                         "status": "AUTHORIZED",
-                        "message": f"Autorizado en {data['cp_id']}"
-                    }).encode()
-                )
-
-                print(f"[driver.request] {data}")
-                print(f"[central.authorize] -> {data['cp_id']}  | [driver.update] AUTHORIZED")
-
-
+                        "message": f"Autorizado en {cp_id}",
+                    }
+                ).encode(),
+            )
+            print(f"🚗 Petición de {driver_id} -> {cp_id} autorizada.")
     finally:
-        await kafka_consumer.stop()
+        await consumer.stop()
 
 
 async def produce_kafka():
@@ -229,16 +242,18 @@ async def produce_kafka():
 
 
 # ---------------------------------------------------------------------------
-# ARRANQUE PRINCIPAL
+# MAIN
 # ---------------------------------------------------------------------------
 
 async def main():
     init_db()
-    # lanzar tareas Kafka
-    asyncio.create_task(consume_kafka())
-    asyncio.create_task(produce_kafka())
 
-    # lanzar servidor HTTP FastAPI
+    loop = asyncio.get_running_loop()
+    threading.Thread(target=monitor_socket_server, args=(loop,), daemon=True).start()
+
+    asyncio.create_task(produce_kafka())
+    asyncio.create_task(consume_kafka())
+
     config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()

@@ -1,120 +1,90 @@
-import asyncio, json, sys, socket, random
-from aiokafka import AIOKafkaProducer
+import asyncio, json, sys, socket
 
 if len(sys.argv) < 6:
-    print("Uso: python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <ip_broker:puerto> <id_cp> <location>")
+    print("Uso: python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <id_cp> <location> <price>")
     sys.exit(1)
 
 ENGINE_ADDR = sys.argv[1]
 CENTRAL_ADDR = sys.argv[2]
-BROKER = sys.argv[3]
-CP_ID = sys.argv[4]
-LOCATION = sys.argv[5].replace("_", " ")
+CP_ID = sys.argv[3]
+LOCATION = sys.argv[4].replace("_", " ")
+PRICE = float(sys.argv[5])
 
 ENGINE_IP, ENGINE_PORT = ENGINE_ADDR.split(":")
 ENGINE_PORT = int(ENGINE_PORT)
+CENTRAL_IP, CENTRAL_PORT = CENTRAL_ADDR.split(":")
+CENTRAL_PORT = int(CENTRAL_PORT)
 
-
-# ---------------------------------------------------------------------------
-# FUNCIONES AUXILIARES
-# ---------------------------------------------------------------------------
-
-def send_id_to_engine():
-    """Envía el ID y localización del CP al Engine por socket TCP."""
+# -------------------------------------------------------------
+# Comunicación con CENTRAL (por socket)
+# -------------------------------------------------------------
+def send_to_central(message):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((CENTRAL_IP, CENTRAL_PORT))
+            s.sendall(json.dumps(message).encode())
+    except Exception as e:
+        print(f"⚠️ Error enviando a CENTRAL: {e}")
+
+# -------------------------------------------------------------
+# Comunicación con ENGINE (por socket)
+# -------------------------------------------------------------
+def send_id_to_engine():
+    """Envía ID y ubicación al Engine y espera ACK."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
             s.connect((ENGINE_IP, ENGINE_PORT))
             s.sendall(json.dumps({"cp_id": CP_ID, "location": LOCATION}).encode())
-            print(f"📨 ID {CP_ID} ({LOCATION}) enviado al Engine ({ENGINE_IP}:{ENGINE_PORT})")
-    except ConnectionRefusedError:
-        print("⚠️ No se pudo conectar con el Engine. ¿Está en ejecución?")
-
-def send_command_to_engine(command):
-    """Envía comandos de control al Engine por socket TCP (por ejemplo, PARAR, ACTIVAR)."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((ENGINE_IP, ENGINE_PORT))
-            s.sendall(json.dumps({"action": command}).encode())
-            print(f"⚙️ Orden '{command}' enviada al Engine")
-    except ConnectionRefusedError:
-        print("⚠️ Engine no responde a la orden.")
-
-def check_engine_connection(timeout=1):
-    """Comprueba si el Engine responde (simula PING)."""
-    try:
-        with socket.create_connection((ENGINE_IP, ENGINE_PORT), timeout=timeout) as s:
-            s.sendall(b"PING")
-            return True
-    except (ConnectionRefusedError, socket.timeout, OSError):
+            ack = s.recv(16).decode().strip()
+            return ack == "ACK"
+    except Exception as e:
+        print(f"❌ Error al enviar ID al Engine: {e}")
         return False
 
-async def send_heartbeat(producer, health_flag):
-    """Envía a CENTRAL el estado de salud (OK o KO) cada segundo."""
-    heartbeat = {"cp_id": CP_ID, "health": health_flag}
-    await producer.send_and_wait("cp.heartbeat", json.dumps(heartbeat).encode())
-    print(f"❤️‍🔥 Heartbeat {CP_ID} ({health_flag})")
+def ping_engine():
+    """Envía heartbeat al Engine y recibe OK/KO."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect((ENGINE_IP, ENGINE_PORT))
+            s.sendall(b"HEARTBEAT")
+            return s.recv(16).decode().strip()
+    except:
+        return None
 
-
-# ---------------------------------------------------------------------------
-# LOOP AUTOMÁTICO DE HEARTBEATS
-# ---------------------------------------------------------------------------
-
-async def heartbeat_loop(producer):
-    """Envía heartbeats automáticos cada segundo."""
+# -------------------------------------------------------------
+# Heartbeat loop
+# -------------------------------------------------------------
+async def heartbeat_loop():
     while True:
-        alive = check_engine_connection()
-        health = "OK" if alive else "KO"
-        await send_heartbeat(producer, health)
+        resp = ping_engine()
+        health = "OK" if resp == "OK" else "KO"
+        send_to_central({
+            "action": "HEARTBEAT",
+            "cp_id": CP_ID,
+            "health": health
+        })
+        print(f"❤️‍🔥 Heartbeat {CP_ID} ({health})")
         await asyncio.sleep(1)
 
-
-# ---------------------------------------------------------------------------
-# MENÚ DEL MONITOR
-# ---------------------------------------------------------------------------
-
-async def menu_monitor(producer):
-    while True:
-        print("\n=== MENÚ MONITOR ===")
-        print("1️⃣  Registrarse en CENTRAL (enviar ID al Engine)")
-        print("2️⃣  Activar punto de recarga")
-        print("3️⃣  Parar punto de recarga")
-        print("4️⃣  Iniciar carga manual (simulada)")
-        print("5️⃣  Salir")
-        op = input("Selecciona opción: ").strip()
-
-        if op == "1":
-            send_id_to_engine()
-        elif op == "2":
-            send_command_to_engine("ACTIVAR")
-        elif op == "3":
-            send_command_to_engine("PARAR")
-        elif op == "4":
-            send_command_to_engine("SUMINISTRAR")
-        elif op == "5":
-            print("👋 Cerrando monitor.")
-            break
-        else:
-            print("❌ Opción no válida.")
-
-
-# ---------------------------------------------------------------------------
-# MAIN PRINCIPAL
-# ---------------------------------------------------------------------------
-
+# -------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------
 async def main():
-    producer = AIOKafkaProducer(bootstrap_servers=BROKER)
-    await producer.start()
-    print(f"🩺 EV_CP_M {CP_ID} monitorizando {ENGINE_ADDR}, CENTRAL {CENTRAL_ADDR}")
-    print(f"Broker Kafka: {BROKER}")
-    print(f"Ubicación: {LOCATION}\n")
-
-    try:
-        # Ejecutar el menú y los heartbeats automáticos en paralelo
-        await asyncio.gather(
-            heartbeat_loop(producer),
-            menu_monitor(producer)
-        )
-    finally:
-        await producer.stop()
+    print(f"🩺 EV_CP_M {CP_ID} iniciado | Engine: {ENGINE_ADDR} | Central: {CENTRAL_ADDR}")
+    # 1️⃣ Registrar en CENTRAL
+    send_to_central({
+        "action": "REGISTER",
+        "cp_id": CP_ID,
+        "location": LOCATION,
+        "price": PRICE
+    })
+    # 2️⃣ Enviar ID al Engine
+    if send_id_to_engine():
+        print(f"✅ Engine confirmó ACK para {CP_ID}. Iniciando heartbeats...")
+        await heartbeat_loop()
+    else:
+        print("❌ No se recibió ACK del Engine. No se iniciarán heartbeats.")
 
 asyncio.run(main())
