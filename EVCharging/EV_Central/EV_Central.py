@@ -155,6 +155,9 @@ async def notify_panel(event: Dict[str, Any]):
 
 kafka_consumer = None
 kafka_producer = None
+# Sesiones activas por CP (mapeo en memoria)
+ACTIVE_SESSIONS = {}  # cp_id -> {"driver_id":..., "request_id":...}
+
 
 async def consume_kafka():
     global kafka_consumer
@@ -162,6 +165,8 @@ async def consume_kafka():
         "cp.heartbeat",
         "cp.status",
         "cp.register",
+        "cp.telemetry",
+        "cp.session_ended",
         "driver.request",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
@@ -194,12 +199,20 @@ async def consume_kafka():
 
                 # 1) (opcional) validar CP en BD; por simplicidad, autorizamos siempre
                 # 2) Avisar al Engine (si está ejecutándose) para que empiece a cargar
+
+                req_cp = data["cp_id"]
+                req_driver = data["driver_id"]
+                req_id = data["request_id"]
+                print(f"[driver.request] {data}")
+                # Esto nos permitirá reenviar telemetrías y el FINISHED al driver correcto.
+                ACTIVE_SESSIONS[req_cp] = {"driver_id": req_driver, "request_id": req_id}
+
                 await kafka_producer.send_and_wait(
                     "central.authorize",
                     json.dumps({
-                        "cp_id": data["cp_id"],
-                        "driver_id": data["driver_id"],
-                        "request_id": data["request_id"]
+                        "cp_id": req_cp,
+                        "driver_id": req_driver,
+                        "request_id": req_id
                     }).encode()
                 )
 
@@ -207,15 +220,52 @@ async def consume_kafka():
                 await kafka_producer.send_and_wait(
                     "driver.update",
                     json.dumps({
-                        "driver_id": data["driver_id"],
-                        "request_id": data["request_id"],
+                        "driver_id": req_driver,
+                        "request_id": req_id,
                         "status": "AUTHORIZED",
-                        "message": f"Autorizado en {data['cp_id']}"
+                        "message": f"Autorizado en {req_cp}"
                     }).encode()
                 )
 
-                print(f"[driver.request] {data}")
                 print(f"[central.authorize] -> {data['cp_id']}  | [driver.update] AUTHORIZED")
+
+            elif topic == "cp.telemetry":
+                sess = ACTIVE_SESSIONS.get(cp_id)
+                if not sess:
+                    # No sabemos qué driver pidió esta sesión (no autorizada por CENTRAL)
+                    continue
+                payload = {
+                    "driver_id": sess["driver_id"],
+                    "request_id": sess["request_id"],
+                    "cp_id": cp_id,
+                    "kw": data.get("kw"),
+                    "kwh_total": data.get("kwh_total"),
+                    "eur_total": data.get("eur_total"),
+                }
+                await kafka_producer.send_and_wait("driver.telemetry", json.dumps(payload).encode())
+
+            elif topic == "cp.session_ended":
+                sess = ACTIVE_SESSIONS.pop(cp_id, None)  # liberamos el CP
+                summary = {
+                    "kwh": data.get("kwh"),
+                    "amount_eur": data.get("amount_eur"),
+                    "reason": data.get("reason", "ENDED"),
+                }
+
+                # (Opcional) actualizar DB de CP a ACTIVADO y notificar panel
+                update_cp(cp_id, "ACTIVADO")
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
+
+                if sess:
+                    await kafka_producer.send_and_wait("driver.update", json.dumps({
+                        "driver_id": sess["driver_id"],
+                        "request_id": sess["request_id"],
+                        "status": "FINISHED",
+                        "message": f"Servicio finalizado en {cp_id}",
+                        "summary": summary
+                    }).encode())
+
+
 
 
     finally:

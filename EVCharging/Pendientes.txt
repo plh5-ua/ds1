@@ -1,0 +1,2 @@
+Pendientes:
+- Validar que el CP está disponible (de momento mi BD sólo crea charging points y no usa el schema.sql completo)
