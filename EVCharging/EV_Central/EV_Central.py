@@ -55,18 +55,12 @@ def get_db():
 
 
 def init_db():
-    schema = """
-    CREATE TABLE IF NOT EXISTS charging_points (
-        id TEXT PRIMARY KEY,
-        location TEXT DEFAULT 'UNKNOWN',
-        price_eur_kwh REAL DEFAULT 0.30,
-        status TEXT DEFAULT 'DESCONECTADO',
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    """
+    with open("schema.sql", "r", encoding="utf-8") as f:
+        schema = f.read()
     with closing(get_db()) as con:
         con.executescript(schema)
         con.commit()
+
 
 
 def update_cp(cp_id: str, status: str = None):
@@ -79,7 +73,7 @@ def update_cp(cp_id: str, status: str = None):
                     "UPDATE charging_points SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (status, cp_id)
                 )
-                print(f"Updated{status}")
+                print(f"Updated {status}")
         else:
             print(f"ERROR: no hay un CP con ese id registrado, no se actualiza la base de datos.")
 
@@ -102,6 +96,48 @@ def list_cps():
     with closing(get_db()) as con:
         rows = con.execute("SELECT * FROM charging_points").fetchall()
         return [dict(r) for r in rows]
+
+
+def db_get_cp(con, cp_id):
+    return con.execute(
+        "SELECT id, status, price_eur_kwh FROM charging_points WHERE id=?",
+        (cp_id,)
+    ).fetchone()
+
+def log_event(cp_id, driver_id, etype, payload):
+    with closing(get_db()) as con:
+        con.execute(
+            "INSERT INTO events (cp_id, driver_id, type, payload) VALUES (?,?,?,?)",
+            (cp_id, driver_id, etype, json.dumps(payload))
+        )
+        con.commit()
+
+def start_session(cp_id, driver_id, price_eur_kwh):
+    with closing(get_db()) as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO sessions (cp_id, driver_id, price_eur_kwh, status) VALUES (?,?,?, 'RUNNING')",
+            (cp_id, driver_id, price_eur_kwh)
+        )
+        sid = cur.lastrowid
+        con.commit()
+        return sid
+
+def update_session_progress(session_id, kwh, amount_eur):
+    with closing(get_db()) as con:
+        con.execute(
+            "UPDATE sessions SET kwh=?, amount_eur=? WHERE id=?",
+            (kwh, amount_eur, session_id)
+        )
+        con.commit()
+
+def end_session(session_id, kwh, amount_eur, ended_status="ENDED"):
+    with closing(get_db()) as con:
+        con.execute(
+            "UPDATE sessions SET ended_at=CURRENT_TIMESTAMP, kwh=?, amount_eur=?, status=? WHERE id=?",
+            (kwh, amount_eur, ended_status, session_id)
+        )
+        con.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -188,82 +224,85 @@ async def consume_kafka():
                 update_cp(cp_id, data.get("status"))
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status")})
             elif topic == "cp.heartbeat":
-                update_cp(cp_id, "ACTIVADO")
-                print(f"mi id: {cp_id}")
-                await notify_panel({"type": "heartbeat", "cp_id": cp_id})
+                health = data.get("health")
+                new_status = "ACTIVADO" if health == "OK" else "AVERIA"
+                update_cp(cp_id, new_status)
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
+                log_event(cp_id, None, "HEARTBEAT", {"health": health})
             elif topic == "driver.request":
-                # data esperado: { "cp_id": "...", "driver_id": "...", "request_id": "..." }
-                # Asegura que el producer está listo (arrancan en paralelo)
                 while kafka_producer is None:
                     await asyncio.sleep(0.05)
 
-                # 1) (opcional) validar CP en BD; por simplicidad, autorizamos siempre
-                # 2) Avisar al Engine (si está ejecutándose) para que empiece a cargar
-
-                req_cp = data["cp_id"]
-                req_driver = data["driver_id"]
-                req_id = data["request_id"]
+                req_cp = data["cp_id"]; req_driver = data["driver_id"]; req_id = data["request_id"]
                 print(f"[driver.request] {data}")
-                # Esto nos permitirá reenviar telemetrías y el FINISHED al driver correcto.
-                ACTIVE_SESSIONS[req_cp] = {"driver_id": req_driver, "request_id": req_id}
 
-                await kafka_producer.send_and_wait(
-                    "central.authorize",
-                    json.dumps({
-                        "cp_id": req_cp,
-                        "driver_id": req_driver,
-                        "request_id": req_id
-                    }).encode()
-                )
+                # ocupado
+                if req_cp in ACTIVE_SESSIONS:
+                    await kafka_producer.send_and_wait("driver.update", json.dumps({
+                        "driver_id": req_driver, "request_id": req_id,
+                        "status": "DENIED", "message": f"CP {req_cp} ocupado: hay una sesión en curso"
+                    }).encode())
+                    continue
 
-                # 3) Notificar al Driver
-                await kafka_producer.send_and_wait(
-                    "driver.update",
-                    json.dumps({
-                        "driver_id": req_driver,
-                        "request_id": req_id,
-                        "status": "AUTHORIZED",
-                        "message": f"Autorizado en {req_cp}"
-                    }).encode()
-                )
+                # validar en BD
+                with closing(get_db()) as con:
+                    row = db_get_cp(con, req_cp)
+                if not row:
+                    await kafka_producer.send_and_wait("driver.update", json.dumps({
+                        "driver_id": req_driver, "request_id": req_id,
+                        "status": "DENIED", "message": f"CP {req_cp} no registrado en CENTRAL"
+                    }).encode()); continue
 
-                print(f"[central.authorize] -> {data['cp_id']}  | [driver.update] AUTHORIZED")
+                cp_status = row["status"]
+                if cp_status in ("DESCONECTADO", "AVERIA", "PARADO") or cp_status != "ACTIVADO":
+                    await kafka_producer.send_and_wait("driver.update", json.dumps({
+                        "driver_id": req_driver, "request_id": req_id,
+                        "status": "DENIED", "message": f"CP {req_cp} no disponible (estado {cp_status})"
+                    }).encode()); continue
+
+                # sesión RUNNING
+                price = row["price_eur_kwh"]
+                session_id = start_session(req_cp, req_driver, price)
+                ACTIVE_SESSIONS[req_cp] = {"driver_id": req_driver, "request_id": req_id, "session_id": session_id}
+                log_event(req_cp, req_driver, "AUTH", {"request_id": req_id})
+
+                # avisar al engine + driver
+                await kafka_producer.send_and_wait("central.authorize", json.dumps({
+                    "cp_id": req_cp, "driver_id": req_driver, "request_id": req_id
+                }).encode())
+                await kafka_producer.send_and_wait("driver.update", json.dumps({
+                    "driver_id": req_driver, "request_id": req_id,
+                    "status": "AUTHORIZED", "message": f"Autorizado en {req_cp}"
+                }).encode())
+
+                print(f"[central.authorize] -> {req_cp}  | [driver.update] AUTHORIZED")
+
 
             elif topic == "cp.telemetry":
                 sess = ACTIVE_SESSIONS.get(cp_id)
                 if not sess:
-                    # No sabemos qué driver pidió esta sesión (no autorizada por CENTRAL)
                     continue
-                payload = {
-                    "driver_id": sess["driver_id"],
-                    "request_id": sess["request_id"],
-                    "cp_id": cp_id,
-                    "kw": data.get("kw"),
-                    "kwh_total": data.get("kwh_total"),
-                    "eur_total": data.get("eur_total"),
-                }
-                await kafka_producer.send_and_wait("driver.telemetry", json.dumps(payload).encode())
+                update_session_progress(sess["session_id"], data.get("kwh_total", 0), data.get("eur_total", 0))
+                log_event(cp_id, sess["driver_id"], "TELEMETRY", data)
+                await kafka_producer.send_and_wait("driver.telemetry", json.dumps({
+                    "driver_id": sess["driver_id"], "request_id": sess["request_id"], "cp_id": cp_id,
+                    "kw": data.get("kw"), "kwh_total": data.get("kwh_total"), "eur_total": data.get("eur_total")
+                }).encode())
 
             elif topic == "cp.session_ended":
-                sess = ACTIVE_SESSIONS.pop(cp_id, None)  # liberamos el CP
-                summary = {
-                    "kwh": data.get("kwh"),
-                    "amount_eur": data.get("amount_eur"),
-                    "reason": data.get("reason", "ENDED"),
-                }
-
-                # (Opcional) actualizar DB de CP a ACTIVADO y notificar panel
+                sess = ACTIVE_SESSIONS.pop(cp_id, None)
+                summary = {"kwh": data.get("kwh"), "amount_eur": data.get("amount_eur"), "reason": data.get("reason", "ENDED")}
                 update_cp(cp_id, "ACTIVADO")
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
-
                 if sess:
+                    end_session(sess["session_id"], summary["kwh"], summary["amount_eur"],
+                                "ENDED" if summary["reason"] == "ENDED" else "ABORTED")
+                    log_event(cp_id, sess["driver_id"], "END", summary)
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
-                        "driver_id": sess["driver_id"],
-                        "request_id": sess["request_id"],
-                        "status": "FINISHED",
-                        "message": f"Servicio finalizado en {cp_id}",
-                        "summary": summary
+                        "driver_id": sess["driver_id"], "request_id": sess["request_id"],
+                        "status": "FINISHED", "message": f"Servicio finalizado en {cp_id}", "summary": summary
                     }).encode())
+
 
 
 
