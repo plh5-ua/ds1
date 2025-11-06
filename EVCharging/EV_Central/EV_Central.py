@@ -20,6 +20,10 @@ from typing import Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+from fastapi.responses import HTMLResponse
+from pathlib import Path
+from pydantic import BaseModel
+
 
 # --- Kafka asíncrono ---
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -157,6 +161,11 @@ def end_session(session_id, kwh, amount_eur, ended_status="ENDED"):
 app = FastAPI(title="EV_Central")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return Path("static/index.html").read_text(encoding="utf-8")
+
+
 PANEL_CLIENTS = set()
 
 
@@ -177,6 +186,16 @@ async def websocket_endpoint(ws: WebSocket):
         PANEL_CLIENTS.discard(ws)
         print("🔌 Cliente desconectado")
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        print("🧹 Cerrando conexión Kafka...")
+        await kafka_consumer.stop()
+        await kafka_producer.stop()
+        print("✅ Kafka cerrado correctamente.")
+    except Exception as e:
+        print("⚠️ Error cerrando Kafka:", e)
+
 
 async def notify_panel(event: Dict[str, Any]):
     dead = []
@@ -187,6 +206,17 @@ async def notify_panel(event: Dict[str, Any]):
             dead.append(ws)
     for ws in dead:
         PANEL_CLIENTS.discard(ws)
+
+class Command(BaseModel):
+    action: str           # "STOP" | "RESUME"
+    cp_id: str = "ALL"    # puedes enviar "ALL" o un ID concreto
+
+@app.post("/command")
+async def send_command(cmd: Command):
+    payload = {"action": cmd.action.upper(), "cp_id": cmd.cp_id}
+    await kafka_producer.send_and_wait("central.command", json.dumps(payload).encode())
+    return {"status": "ok", "sent": payload}
+
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +425,16 @@ async def consume_kafka():
                     "kwh_total": data.get("kwh_total"),
                     "eur_total": data.get("eur_total")
                 }).encode())
+
+                await notify_panel({
+                    "type": "telemetry",
+                    "cp_id": data["cp_id"],
+                    "driver_id": data.get("driver_id"),
+                    "kw": data.get("kw"),
+                    "kwh_total": data.get("kwh_total"),
+                    "eur_total": data.get("eur_total"),
+                    "status": "SUMINISTRANDO"
+                })
 
             elif topic == "cp.session_ended":
                 sess = ACTIVE_SESSIONS.pop(cp_id, None)

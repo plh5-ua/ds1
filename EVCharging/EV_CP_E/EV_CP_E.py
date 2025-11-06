@@ -211,11 +211,32 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
                 await start_charging(producer)
             elif msg.topic == "central.command":
                 action = data.get("action", "").upper()
-                print(f"⚙️ Orden recibida desde CENTRAL: {action}")
-                if action == "PARAR":
+                target = data.get("cp_id", "ALL")
+                print(f"⚙️ Orden recibida desde CENTRAL: {action} → {target}")
+
+                # Aplica si el comando es global o para este CP concreto
+                if target != "ALL" and target != CP_ID:
+                    continue
+
+                if action == "STOP":
+                    STOP.set()  # detiene carga si está en curso
                     await send_status(producer, "PARADO")
-                elif action == "REANUDAR":
+                    # Notificar fin de sesión (si estaba suministrando)
+                    end_msg = {
+                        "cp_id": CP_ID,
+                        "session_id": 1,
+                        "kwh": 0.0,
+                        "amount_eur": 0.0,
+                        "reason": "ABORTED"
+                    }
+                    await producer.send_and_wait("cp.session_ended", json.dumps(end_msg).encode())
+                    print(f"🛑 Carga detenida por CENTRAL en {CP_ID}")
+
+                elif action == "RESUME":
+                    STOP.clear()
                     await send_status(producer, "ACTIVADO")
+                    print(f"▶️ CP {CP_ID} reanudado por CENTRAL")
+
     except asyncio.CancelledError:
         pass
 
