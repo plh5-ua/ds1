@@ -1,0 +1,86 @@
+Pendientes:
+- Validar que el CP está disponible (de momento mi BD sólo crea charging points y no usa el schema.sql completo)
+
+Central (EV_Central)
+
+ Validar autorización antes de central.authorize: CP existe, ACTIVADO, no AVERIA/PARADO, no ocupado (usa ACTIVE_SESSIONS). (ya te pasé bloque)
+
+ Denegar si ocupado: si cp_id está en ACTIVE_SESSIONS → DENIED.
+
+ Persistencia real con schema.sql:
+
+ Cargar schema.sql en init_db().
+
+ Crear sesión RUNNING al autorizar y guardar session_id en ACTIVE_SESSIONS.
+
+ Actualizar progreso en cp.telemetry (kWh/€) y log de eventos.
+
+ Cerrar sesión en cp.session_ended (ENDED/ABORTED) y log de eventos.
+
+ Heartbeat KO/OK:
+
+ Reflejar AVERIA cuando health="KO", ACTIVADO cuando vuelve a “OK”.
+
+ (Opcional) Si hay sesión activa y llega KO → enviar central.command PARAR para abortar.
+
+ /command (opcional recomendado): endpoint HTTP para mandar PARAR/REANUDAR a un CP o a todos (publica central.command).
+
+ ensure_kafka_topics() al arrancar (opcional pero muy recomendable).
+
+ Limpiar logs menores (p. ej., “Updated ACTVADO” con espacio, mensaje amable si CP ya existe).
+
+Engine (EV_CP_E)
+
+ Sesión más larga (p. ej., 120 s) para poder probar “ocupado” y denegaciones. (ya te pasé función)
+
+ Responder a central.command:
+
+ PARAR → abortar carga en curso (reason = ABORTED), volver a ACTIVADO.
+
+ REANUDAR → cambiar estado a ACTIVADO (no necesariamente relanza carga sin nueva autorización).
+
+ Mantener cierre limpio con Ctrl+C (ya OK con la versión asyncio).
+
+Monitor (EV_CP_M)
+
+ Cierre limpio con Ctrl+C y con la opción “Salir” (usar STOP y cancelar heartbeat). (parche listo)
+
+ (Opcional) Enviar ACTIVAR/PARAR locales y probar que Central también los refleja.
+
+ (Opcional) Enviar SUMINISTRAR con duración (duration en segundos) para pruebas controladas.
+
+Driver (EV_Driver)
+
+ (Opcional) Cierre sin traceback al Ctrl+C (parche listo).
+
+ (Opcional) Guardar ticket JSON por sesión (request_id.json) con kWh/€.
+
+ (Opcional) Mostrar € con 3 decimales durante telemetría.
+
+Base de datos / Panel
+
+ Usar schema.sql (sessions/events) en lugar del esquema embebido.
+
+ (Opcional) Endpoint GET /sessions y GET /events para consultar histórico.
+
+ (Opcional) Panel WebSocket: además de status, enviar última telemetría por CP para pintar progreso.
+
+Kafka / Infra
+
+ Asegurar mismo broker en todos (localhost:9092).
+
+ Si no usas autocreación: ensure_kafka_topics() en Central.
+
+ Scripts .bat/.sh para lanzar Central, Engine, Monitor, Driver en 1-click.
+
+Pruebas que deben verse en la demo
+
+ Flujo feliz: Driver A → AUTHORIZED → telemetría → FINISHED.
+
+ CP ocupado: mientras A carga, Driver B → DENIED (mensaje claro).
+
+ AVERÍA: simular KO (desde Monitor) → Central marca AVERIA; (opcional) aborta sesión activa.
+
+ PARAR/REANUDAR: desde /command o Monitor → Engine responde y Central refleja estados.
+
+ Persistencia: al finalizar, comprobar fila en sessions con kWh/€ y eventos asociados.

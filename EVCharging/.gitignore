@@ -1,0 +1,36 @@
+# Entorno y cachés
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pid
+*.log
+.python-version
+
+# Herramientas/IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# Construcción/packaging
+build/
+dist/
+*.egg-info/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SO varios
+.DS_Store
+Thumbs.db
+
+# Variables de entorno / secretos
+.env
+.env.*
+
+# basedata+
+*.db
+EV_Central/evcentral.dbEV_Central/*.db

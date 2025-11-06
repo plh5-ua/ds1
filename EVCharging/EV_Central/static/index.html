@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>EV Central - Panel de Monitorización</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f5f5f5; color: #333; text-align: center; }
+    h1 { color: #007bff; }
+    table { margin: 20px auto; border-collapse: collapse; width: 85%; }
+    th, td { border: 1px solid #ccc; padding: 10px; }
+    th { background: #eee; }
+    .estado { font-weight: bold; color: white; border-radius: 4px; padding: 5px 10px; }
+    .ACTIVADO { background: #28a745; }
+    .SUMINISTRANDO { background: #007bff; }
+    .PARADO { background: orange; }
+    .DESCONECTADO { background: gray; }
+    .AVERIA { background: red; }
+    button {
+      margin: 2px;
+      padding: 5px 8px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button.stop { background: orange; color: white; }
+    button.resume { background: #28a745; color: white; }
+    button.global { margin: 5px; padding: 8px 12px; }
+  </style>
+</head>
+<body>
+  <h1>⚡ EV Central - Panel de Monitorización ⚡</h1>
+
+  <!-- Botones globales -->
+  <div style="margin-bottom: 15px;">
+    <button class="global stop" onclick="sendCommand('STOP', 'ALL')">🛑 STOP ALL</button>
+    <button class="global resume" onclick="sendCommand('RESUME', 'ALL')">▶️ RESUME ALL</button>
+  </div>
+
+  <table id="cpTable">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Ubicación</th>
+        <th>Precio (€/kWh)</th>
+        <th>Estado</th>
+        <th>Última actualización</th>
+        <th>Acciones</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <script>
+    const tableBody = document.querySelector("#cpTable tbody");
+
+    // Crear o actualizar fila en la tabla
+    function updateRow(cp) {
+      let row = document.getElementById(cp.id);
+      const now = new Date().toLocaleTimeString();
+
+      if (!row) {
+        row = document.createElement("tr");
+        row.id = cp.id;
+        row.innerHTML = `
+          <td>${cp.id}</td>
+          <td>${cp.location}</td>
+          <td>${cp.price_eur_kwh.toFixed(2)}</td>
+          <td class="estado ${cp.status}">${cp.status}</td>
+          <td>${now}</td>
+          <td>
+            <button class="stop" onclick="sendCommand('STOP', '${cp.id}')">STOP</button>
+            <button class="resume" onclick="sendCommand('RESUME', '${cp.id}')">RESUME</button>
+          </td>
+        `;
+        tableBody.appendChild(row);
+      } else {
+        // Actualizar datos
+        row.children[3].textContent = cp.status;
+        row.children[3].className = "estado " + cp.status;
+        row.children[4].textContent = now;
+      }
+    }
+
+    // Cargar puntos iniciales desde la API
+    async function loadCPs() {
+      const res = await fetch("/cp");
+      const data = await res.json();
+      data.forEach(updateRow);
+    }
+
+    // Enviar comando STOP/RESUME a la central
+    async function sendCommand(action, cpId) {
+      try {
+        const res = await fetch('/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, cp_id: cpId })
+        });
+        const data = await res.json();
+        console.log('Command sent:', data);
+      } catch (err) {
+        console.error('Error sending command:', err);
+      }
+    }
+
+    // Conexión WebSocket para recibir eventos en tiempo real
+    function connectWebSocket() {
+      const ws = new WebSocket(`ws://${window.location.host}/ws`);
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        console.log("Evento recibido:", msg);
+
+        // Filtrar eventos relevantes
+        if ((msg.id || msg.cp_id) && msg.status) {
+          updateRow({
+            id: msg.id || msg.cp_id,
+            location: msg.location || "Desconocida",
+            price_eur_kwh: msg.price_eur_kwh || 0.3,
+            status: msg.status
+          });
+        }
+      };
+      ws.onopen = () => console.log("✅ Conectado al panel WebSocket");
+      ws.onclose = () => console.log("❌ Desconectado del panel WebSocket");
+    }
+
+    loadCPs();
+    connectWebSocket();
+  </script>
+</body>
+</html>
