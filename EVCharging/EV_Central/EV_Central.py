@@ -34,6 +34,8 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 LAST_HEARTBEAT = {}
 HEARTBEAT_TIMEOUT = 3  # segundos sin recibir heartbeat → DESCONECTADO
 
+# Última telemetría por CP para exponerla en /cp y en el panel
+LAST_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
 # ARGUMENTOS DE EJECUCIÓN
@@ -192,7 +194,18 @@ PANEL_CLIENTS = set()
 
 @app.get("/cp")
 def api_list_cps():
-    return list_cps()
+    cps = list_cps()
+    for cp in cps:
+        lt = LAST_TELEMETRY.get(cp["id"])
+        if lt:
+            cp["kwh_total"] = lt.get("kwh_total", 0.0)
+            cp["eur_total"] = lt.get("eur_total", 0.0)
+            cp["driver_id"] = lt.get("driver_id")
+        else:
+            cp["kwh_total"] = None
+            cp["eur_total"] = None
+            cp["driver_id"] = None
+    return cps
 
 
 @app.websocket("/ws")
@@ -472,27 +485,43 @@ async def consume_kafka():
             elif topic == "cp.telemetry":
                 sess = ACTIVE_SESSIONS.get(cp_id)
                 if not sess:
-                    # Telemetría de una sesión que CENTRAL no abrió
+                    # Telemetría sin sesión creada por CENTRAL (ignora o registra si quieres)
                     continue
-                update_session_progress(sess["session_id"], data.get("kwh_total", 0.0), data.get("eur_total", 0.0))
+
+                kwh_total = data.get("kwh_total", 0.0)
+                eur_total = data.get("eur_total", 0.0)
+
+                # 1) Persistir progreso de la sesión
+                update_session_progress(sess["session_id"], kwh_total, eur_total)
                 log_event(cp_id, sess["driver_id"], "TELEMETRY", data)
-                # reenviar al Driver dueño de la request
+
+                # 2) Guardar última telemetría en memoria (para API/panel)
+                LAST_TELEMETRY[cp_id] = {
+                    "kwh_total": kwh_total,
+                    "eur_total": eur_total,
+                    "driver_id": sess["driver_id"]
+                }
+
+                # 3) Asegurar que el CP queda en estado SUMINISTRANDO mientras llegan telemetrías
+                update_cp(cp_id, "SUMINISTRANDO")
+
+                # 4) Reenviar al Driver (app del conductor)
                 await kafka_producer.send_and_wait("driver.telemetry", json.dumps({
                     "driver_id": sess["driver_id"],
                     "request_id": sess["request_id"],
                     "cp_id": cp_id,
                     "kw": data.get("kw"),
-                    "kwh_total": data.get("kwh_total"),
-                    "eur_total": data.get("eur_total")
+                    "kwh_total": kwh_total,
+                    "eur_total": eur_total
                 }).encode())
 
+                # 5) Notificar al panel con status verde SUMINISTRANDO + totales + driver
                 await notify_panel({
                     "type": "telemetry",
-                    "cp_id": data["cp_id"],
-                    "driver_id": data.get("driver_id"),
-                    "kw": data.get("kw"),
-                    "kwh_total": data.get("kwh_total"),
-                    "eur_total": data.get("eur_total"),
+                    "cp_id": cp_id,
+                    "driver_id": sess["driver_id"],
+                    "kwh_total": kwh_total,
+                    "eur_total": eur_total,
                     "status": "SUMINISTRANDO"
                 })
 
@@ -500,7 +529,10 @@ async def consume_kafka():
                 sess = ACTIVE_SESSIONS.pop(cp_id, None)
                 reason = (data.get("reason") or "ENDED").upper()
 
-                # Si fue STOP/ABORTED, el CP debe quedar PARADO
+                # Limpia última telemetría en memoria (ya terminó)
+                LAST_TELEMETRY.pop(cp_id, None)
+
+                # Si fue STOP/ABORTED, PARADO; si no, ACTIVADO
                 new_status = "PARADO" if reason == "ABORTED" else "ACTIVADO"
                 update_cp(cp_id, new_status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
@@ -526,7 +558,6 @@ async def consume_kafka():
                                     "amount_eur": data.get("amount_eur"),
                                     "reason": reason}
                     }).encode())
-
 
 
     finally:

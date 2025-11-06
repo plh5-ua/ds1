@@ -68,7 +68,7 @@ async def start_charging(producer: AIOKafkaProducer):
         if STOP.is_set():
             break
         kw = round(random.uniform(6.0, 7.5), 2)
-        kwh += kw / 3600
+        kwh += kw / 3600  * 60 * 10 #SIMULAMOS CARGA 10 MINUTOS POR SEGUNDO
         amount = round(kwh * PRICE, 3)
         telem = {
             "cp_id": CP_ID,
