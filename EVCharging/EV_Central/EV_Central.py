@@ -87,6 +87,14 @@ def insert_cp(cp_id: str, location: str, price: float = 0.3):
             )
         con.commit()
 
+def is_suministrando_cp(cp_id: str) -> bool:
+    with closing(get_db()) as con:
+        cur = con.cursor()
+        row = cur.execute("SELECT status FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+    if row is None:
+        return False  
+    status = row[0] 
+    return status.upper() == "SUMINISTRANDO"
 
 def update_cp(cp_id: str, status: str):
     with closing(get_db()) as con:
@@ -258,16 +266,19 @@ def monitor_socket_server(loop):
                 )
 
             elif action == "HEARTBEAT":
-                # 🆕 registrar la hora del último heartbeat recibido
+                # registrar la hora del último heartbeat recibido
                 LAST_HEARTBEAT[cp_id] = loop.time()
 
                 health = (msg.get("health") or "KO").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
-                update_cp(cp_id, new_status)
-                cp_data = get_cp_from_db(cp_id) or {"id": cp_id, "status": new_status}
-                cp_data["status"] = new_status
-                asyncio.run_coroutine_threadsafe(
-                    notify_panel({"type": "heartbeat", **cp_data}), loop,
+                if new_status == "ACTIVADO" and is_suministrando_cp(cp_id):
+                    pass
+                else:
+                    update_cp(cp_id, new_status)
+                    cp_data = get_cp_from_db(cp_id) or {"id": cp_id, "status": new_status}
+                    cp_data["status"] = new_status
+                    asyncio.run_coroutine_threadsafe(
+                        notify_panel({"type": "heartbeat", **cp_data}), loop,
                 )
                 try:
                     conn.sendall(health.encode())
