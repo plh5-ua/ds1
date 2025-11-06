@@ -15,6 +15,8 @@ import threading
 import socket
 from contextlib import closing
 from typing import Dict, Any
+from collections import deque
+from datetime import datetime
 
 # --- FastAPI / WebSocket ---
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -23,6 +25,8 @@ import uvicorn
 from fastapi.responses import HTMLResponse
 from pathlib import Path
 from pydantic import BaseModel
+
+
 
 
 # --- Kafka asíncrono ---
@@ -34,7 +38,14 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 LAST_HEARTBEAT = {}
 HEARTBEAT_TIMEOUT = 3  # segundos sin recibir heartbeat → DESCONECTADO
 
+# Última telemetría por CP para exponerla en /cp y en el panel
+LAST_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 
+# --- Estado y buffers de CENTRAL ---
+CENTRAL_STATUS = "OK"
+LAST_MESSAGES = deque(maxlen=5)     # últimos 5 mensajes
+RECENT_SESSIONS = deque(maxlen=50)  # histórico corto de inicios de sesión
+MAIN_LOOP = None 
 # ---------------------------------------------------------------------------
 # ARGUMENTOS DE EJECUCIÓN
 # ---------------------------------------------------------------------------
@@ -192,7 +203,18 @@ PANEL_CLIENTS = set()
 
 @app.get("/cp")
 def api_list_cps():
-    return list_cps()
+    cps = list_cps()
+    for cp in cps:
+        lt = LAST_TELEMETRY.get(cp["id"])
+        if lt:
+            cp["kwh_total"] = lt.get("kwh_total", 0.0)
+            cp["eur_total"] = lt.get("eur_total", 0.0)
+            cp["driver_id"] = lt.get("driver_id")
+        else:
+            cp["kwh_total"] = None
+            cp["eur_total"] = None
+            cp["driver_id"] = None
+    return cps
 
 
 @app.websocket("/ws")
@@ -206,6 +228,25 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         PANEL_CLIENTS.discard(ws)
         print("🔌 Cliente desconectado")
+@app.get("/central/summary")
+def api_central_summary():
+    return {
+        "status": CENTRAL_STATUS,
+        "messages": list(LAST_MESSAGES),
+        "sessions": list(RECENT_SESSIONS)
+    }
+
+from fastapi import Body
+@app.post("/central/state")
+async def api_set_central_state(payload: Dict[str, Any] = Body(...)):
+    global CENTRAL_STATUS
+    status = (payload.get("status") or "OK").upper()
+    if status not in ("OK", "STOP"):
+        return {"ok": False, "error": "status debe ser OK o STOP"}
+    CENTRAL_STATUS = status
+    await notify_central_state()
+    log_central_msg("CENTRAL_STATE", {"status": CENTRAL_STATUS})
+    return {"ok": True, "status": CENTRAL_STATUS}
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -227,6 +268,20 @@ async def notify_panel(event: Dict[str, Any]):
             dead.append(ws)
     for ws in dead:
         PANEL_CLIENTS.discard(ws)
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+def log_central_msg(msg_type: str, detail: dict):
+    item = {"ts": now_iso(), "msg_type": msg_type, "detail": detail}  
+    LAST_MESSAGES.append(item)
+    loop = MAIN_LOOP or asyncio.get_running_loop()
+    asyncio.run_coroutine_threadsafe(
+        notify_panel({"type": "central.msg", **item}), 
+        loop
+    )
+
+async def notify_central_state():
+    await notify_panel({"type": "central.state", "status": CENTRAL_STATUS})
 
 class Command(BaseModel):
     action: str           # "STOP" | "RESUME"
@@ -294,6 +349,7 @@ def monitor_socket_server(loop):
                 asyncio.run_coroutine_threadsafe(
                     notify_panel({"type": "register", **cp_data}), loop,
                 )
+                log_central_msg("REGISTER", {"cp_id": cp_id, "location": location, "price": price})
 
             elif action == "HEARTBEAT":
                 LAST_HEARTBEAT[cp_id] = loop.time()
@@ -370,8 +426,9 @@ async def monitor_disconnections():
                 if cp_data:
                     cp_data["status"] = "DESCONECTADO"
                     await notify_panel({"type": "heartbeat", **cp_data})
-                # eliminar para no repetir
+                log_central_msg("DISCONNECTED", {"cp_id": cp_id, "since_sec": HEARTBEAT_TIMEOUT})
                 del LAST_HEARTBEAT[cp_id]
+
         await asyncio.sleep(2)
 
 # ---------------------------------------------------------------------------
@@ -412,6 +469,8 @@ async def consume_kafka():
             topic = msg.topic
             data = msg.value
             cp_id = data.get("cp_id")
+            location = data.get("location")
+            price = data.get("kwh", 0.30)
 
             if topic == "cp.register":
                 # Registro de Engine (vía Kafka)
@@ -425,6 +484,8 @@ async def consume_kafka():
                     float(price)
                 )
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
+                log_central_msg("REGISTER", {"cp_id": cp_id, "location": location, "price": price})
+
 
             elif topic == "cp.status":
                 status = data.get("status", "ACTIVADO")
@@ -443,6 +504,8 @@ async def consume_kafka():
                 update_cp(cp_id, new_status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
                 log_event(cp_id, None, "HEARTBEAT", {"health": health})
+                log_central_msg("HEARTBEAT", {"cp_id": cp_id, "status": new_status})
+
 
             elif topic == "driver.request":
                 req_cp = data["cp_id"]; req_driver = data["driver_id"]; req_id = data["request_id"]
@@ -484,6 +547,21 @@ async def consume_kafka():
                 }
                 log_event(req_cp, req_driver, "AUTH", {"request_id": req_id})
 
+                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                # Añadidos para la tabla "Sesiones iniciadas" y "Últimos 5 mensajes"
+                started_item = {
+                    "ts": now_iso(),           # helper que devuelve fecha/hora ISO
+                    "cp_id": req_cp,
+                    "driver_id": req_driver,
+                    "session_id": session_id
+                }
+                RECENT_SESSIONS.appendleft(started_item)                     # buffer en memoria
+                await notify_panel({"type": "session.started", **started_item})
+                log_central_msg("SESSION_STARTED", {                         # para últimos 5 mensajes
+                    "cp_id": req_cp, "driver_id": req_driver, "session_id": session_id
+                })
+                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
                 # 4) Avisar a Engine y Driver
                 await kafka_producer.send_and_wait("central.authorize", json.dumps({
                     "cp_id": req_cp, "driver_id": req_driver, "request_id": req_id
@@ -497,35 +575,56 @@ async def consume_kafka():
             elif topic == "cp.telemetry":
                 sess = ACTIVE_SESSIONS.get(cp_id)
                 if not sess:
-                    # Telemetría de una sesión que CENTRAL no abrió
+                    # Telemetría sin sesión creada por CENTRAL (ignora o registra si quieres)
                     continue
-                update_session_progress(sess["session_id"], data.get("kwh_total", 0.0), data.get("eur_total", 0.0))
+
+                kwh_total = data.get("kwh_total", 0.0)
+                eur_total = data.get("eur_total", 0.0)
+
+                # 1) Persistir progreso de la sesión
+                update_session_progress(sess["session_id"], kwh_total, eur_total)
                 log_event(cp_id, sess["driver_id"], "TELEMETRY", data)
-                # reenviar al Driver dueño de la request
+
+                # 2) Guardar última telemetría en memoria (para API/panel)
+                LAST_TELEMETRY[cp_id] = {
+                    "kwh_total": kwh_total,
+                    "eur_total": eur_total,
+                    "driver_id": sess["driver_id"]
+                }
+
+                # 3) Asegurar que el CP queda en estado SUMINISTRANDO mientras llegan telemetrías
+                update_cp(cp_id, "SUMINISTRANDO")
+
+                # 4) Reenviar al Driver (app del conductor)
                 await kafka_producer.send_and_wait("driver.telemetry", json.dumps({
                     "driver_id": sess["driver_id"],
                     "request_id": sess["request_id"],
                     "cp_id": cp_id,
                     "kw": data.get("kw"),
-                    "kwh_total": data.get("kwh_total"),
-                    "eur_total": data.get("eur_total")
+                    "kwh_total": kwh_total,
+                    "eur_total": eur_total
                 }).encode())
 
+                # 5) Notificar al panel con status verde SUMINISTRANDO + totales + driver
                 await notify_panel({
                     "type": "telemetry",
-                    "cp_id": data["cp_id"],
-                    "driver_id": data.get("driver_id"),
-                    "kw": data.get("kw"),
-                    "kwh_total": data.get("kwh_total"),
-                    "eur_total": data.get("eur_total"),
+                    "cp_id": cp_id,
+                    "driver_id": sess["driver_id"],
+                    "kwh_total": kwh_total,
+                    "eur_total": eur_total,
                     "status": "SUMINISTRANDO"
                 })
+                log_central_msg("TELEMETRY", {"cp_id": cp_id, "kwh_total": kwh_total, "eur_total": eur_total})
+
 
             elif topic == "cp.session_ended":
                 sess = ACTIVE_SESSIONS.pop(cp_id, None)
                 reason = (data.get("reason") or "ENDED").upper()
 
-                # Si fue STOP/ABORTED, el CP debe quedar PARADO
+                # Limpia última telemetría en memoria (ya terminó)
+                LAST_TELEMETRY.pop(cp_id, None)
+
+                # Si fue STOP/ABORTED, PARADO; si no, ACTIVADO
                 new_status = "PARADO" if reason == "ABORTED" else "ACTIVADO"
                 update_cp(cp_id, new_status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
@@ -551,6 +650,8 @@ async def consume_kafka():
                                     "amount_eur": data.get("amount_eur"),
                                     "reason": reason}
                     }).encode())
+                    log_central_msg("SESSION_ENDED", {"cp_id": cp_id, "reason": reason})
+                    
 
 
 
@@ -569,14 +670,19 @@ async def produce_kafka():
 # ---------------------------------------------------------------------------
 
 async def main():
+    global MAIN_LOOP
     init_db()
+    asyncio.create_task(notify_central_state())
 
     # Al iniciar, marcar todos los CPs como DESCONECTADOS
     mark_all_cps_disconnected()
 
-    # Hilo para servidor de monitores (socket bloqueante)
-    loop = asyncio.get_running_loop()
-    threading.Thread(target=monitor_socket_server, args=(loop,), daemon=True).start()
+
+    # Guarda loop principal
+    MAIN_LOOP = asyncio.get_running_loop()
+
+    # Hilo servidor monitores
+    threading.Thread(target=monitor_socket_server, args=(MAIN_LOOP,), daemon=True).start()
 
     # Kafka
     asyncio.create_task(produce_kafka())
