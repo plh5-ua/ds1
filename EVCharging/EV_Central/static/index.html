@@ -11,7 +11,7 @@
     th { background: #eee; }
     .estado { font-weight: bold; color: white; border-radius: 4px; padding: 5px 10px; }
     .ACTIVADO { background: #28a745; }
-    .SUMINISTRANDO { background: #28a745; }
+    .SUMINISTRANDO { background: #28a745; }  /* verde */
     .PARADO { background: orange; }
     .DESCONECTADO { background: gray; }
     .AVERIA { background: red; }
@@ -31,12 +31,13 @@
 <body>
   <h1>⚡ EV Central - Panel de Monitorización ⚡</h1>
 
-  <!-- Botones globales -->
+  <!-- Botones globales (si /command está implementado en la API) -->
   <div style="margin-bottom: 15px;">
     <button class="global stop" onclick="sendCommand('STOP', 'ALL')">🛑 STOP ALL</button>
     <button class="global resume" onclick="sendCommand('RESUME', 'ALL')">▶️ RESUME ALL</button>
   </div>
 
+  <!-- Tabla principal CPs -->
   <table id="cpTable">
     <thead>
       <tr>
@@ -44,9 +45,9 @@
         <th>Ubicación</th>
         <th>Precio (€/kWh)</th>
         <th>Estado</th>
-          <th>kWh total</th>        
-          <th>€ total</th>          
-          <th>Driver</th>   
+        <th>kWh total</th>
+        <th>€ total</th>
+        <th>Driver</th>
         <th>Última actualización</th>
         <th>Acciones</th>
       </tr>
@@ -54,10 +55,46 @@
     <tbody></tbody>
   </table>
 
-  <script>
-    const tableBody = document.querySelector("#cpTable tbody");
+  <!-- Sesiones iniciadas -->
+  <h2>Sesiones iniciadas</h2>
+  <table id="sessionsTable">
+    <thead>
+      <tr>
+        <th>Inicio (fecha/hora)</th>
+        <th>Driver</th>
+        <th>CP</th>
+        <th>Session ID</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
-    // Normaliza objeto CP
+  <!-- Últimos 5 mensajes -->
+  <h2>Últimos 5 mensajes</h2>
+  <table id="messagesTable">
+    <thead>
+      <tr>
+        <th>Fecha/Hora</th>
+        <th>Tipo</th>
+        <th>Detalle</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- Estado central -->
+  <div id="centralState" style="margin-top: 12px; font-weight: bold;">
+    Estado de CENTRAL: <span id="centralStateValue">—</span>
+  </div>
+
+  <script>
+    // --- Referencias DOM ---
+    const tableBody = document.querySelector("#cpTable tbody");
+    const sessionsBody = document.querySelector("#sessionsTable tbody");
+    const messagesBody = document.querySelector("#messagesTable tbody");
+    const centralStateValue = document.getElementById("centralStateValue");
+
+    // --- Helpers ---
     function normalize(cp) {
       return {
         id: cp.id || cp.cp_id,
@@ -69,11 +106,11 @@
         driver_id: cp.driver_id ?? null
       };
     }
-
     function fmt(n, digits = 3) {
       return (n === null || n === undefined) ? "—" : Number(n).toFixed(digits);
     }
 
+    // --- Tabla principal: crear/actualizar fila CP ---
     function updateRow(raw) {
       const cp = normalize(raw);
       let row = document.getElementById(cp.id);
@@ -98,30 +135,77 @@
         `;
         tableBody.appendChild(row);
       } else {
-        // Ubicación y precio no cambian a menudo, pero actualízalos si llegan
         row.children[1].textContent = cp.location;
         row.children[2].textContent = cp.price_eur_kwh.toFixed(2);
 
-        // Estado y clase (pinta SUMINISTRANDO en verde)
         row.children[3].textContent = cp.status;
-        row.children[3].className = "estado " + cp.status;
+        row.children[3].className = "estado " + cp.status; // pinta SUMINISTRANDO en verde
 
-        // Totales y driver (si vienen nulos, deja el último valor visual)
         if (cp.kwh_total !== null) row.children[4].textContent = fmt(cp.kwh_total, 3);
         if (cp.eur_total !== null) row.children[5].textContent = fmt(cp.eur_total, 2);
         if (cp.driver_id !== null) row.children[6].textContent = cp.driver_id;
 
-        // Marca última actualización
+        if (cp.status !== "SUMINISTRANDO") {
+          row.children[4].textContent = "—";  // kWh total
+          row.children[5].textContent = "—";  // € total
+          row.children[6].textContent = "—";  // driver
+        }
         row.children[7].textContent = now;
       }
     }
 
+    // --- Tablas inferiores ---
+    function prependSessionRow(s) {
+      const tr = document.createElement("tr");
+      tr.id = `sess-${s.session_id}`;
+      tr.innerHTML = `
+        <td>${s.ts}</td>
+        <td>${s.driver_id}</td>
+        <td>${s.cp_id}</td>
+        <td>${s.session_id}</td>
+      `;
+      sessionsBody.prepend(tr);
+      while (sessionsBody.children.length > 50) sessionsBody.removeChild(sessionsBody.lastChild);
+    }
+function prependMessageRow(m) {
+  // Normaliza: acepta tanto {type, detail} como {msg_type, detail}
+  const ts = m.ts || new Date().toLocaleString();
+  const msgType = m.msg_type || m.type || "MSG";
+  const detail = JSON.stringify(m.detail ?? m);
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td>${ts}</td>
+    <td>${msgType}</td>
+    <td style="font-family: monospace;">${detail}</td>
+  `;
+  messagesBody.prepend(tr);
+  while (messagesBody.children.length > 5) messagesBody.removeChild(messagesBody.lastChild);
+}
+
+
+
+    // --- Carga inicial desde API ---
     async function loadCPs() {
       const res = await fetch("/cp");
       const data = await res.json();
       data.forEach(updateRow);
     }
+    async function loadCentralSummary() {
+      try {
+        const res = await fetch("/central/summary");
+        const data = await res.json();
+        // Estado
+        centralStateValue.textContent = data.status || "—";
+        // Sesiones (más antiguas primero para que las recientes queden arriba con prepend)
+        (data.sessions || []).reverse().forEach(prependSessionRow);
+        // Mensajes
+        (data.messages || []).reverse().forEach(prependMessageRow);
+      } catch (e) {
+        console.warn("No se pudo cargar /central/summary:", e);
+      }
+    }
 
+    // --- Comandos (si el endpoint /command existe) ---
     async function sendCommand(action, cpId) {
       try {
         const res = await fetch('/command', {
@@ -136,15 +220,24 @@
       }
     }
 
+    // --- WebSocket: eventos live ---
     function connectWebSocket() {
       const ws = new WebSocket(`ws://${window.location.host}/ws`);
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        // Soportar tanto eventos de estado como telemetría
+        // Últimos 5 mensajes (buffer)
+        if (msg.type === "central.msg") {
+          prependMessageRow(msg);
+          return;
+        }
+        // Actualizaciones de estado (status) → tabla principal
         if ((msg.id || msg.cp_id) && msg.status) {
           updateRow(msg);
-        } else if (msg.type === "telemetry") {
-          // Telemetría: fuerza SUMINISTRANDO (verde) y actualiza totales y driver
+          return;
+        }
+
+        // Telemetría → fuerza SUMINISTRANDO + totales + driver
+        if (msg.type === "telemetry") {
           updateRow({
             cp_id: msg.cp_id,
             status: "SUMINISTRANDO",
@@ -152,13 +245,33 @@
             eur_total: msg.eur_total,
             driver_id: msg.driver_id
           });
+          return;
+        }
+
+        // Nueva sesión iniciada (para la tabla inferior)
+        if (msg.type === "session.started") {
+          prependSessionRow(msg);
+          return;
+        }
+        if (msg.type === "session.ended") {
+          const tr = document.getElementById(`sess-${msg.session_id}`);
+          if (tr && tr.parentNode) tr.parentNode.removeChild(tr); // o marca FINISHED si prefieres
+          prependMessageRow({ ts: msg.ts, msg_type: "SESSION_ENDED", detail: msg });
+          return;
+        }
+        // Estado de CENTRAL (OK/STOP)
+        if (msg.type === "central.state") {
+          centralStateValue.textContent = msg.status;
+          return;
         }
       };
       ws.onopen = () => console.log("✅ Conectado al panel WebSocket");
       ws.onclose = () => console.log("❌ Desconectado del panel WebSocket");
     }
 
+    // Arranque
     loadCPs();
+    loadCentralSummary();
     connectWebSocket();
   </script>
 
