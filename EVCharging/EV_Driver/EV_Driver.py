@@ -9,12 +9,15 @@ async def run(broker, driver_id, cp_ids):
         "driver.update",
         "driver.telemetry",
         bootstrap_servers=broker,
-        value_deserializer=lambda b: json.loads(b.decode("utf-8"))
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+        auto_offset_reset="latest",
+        group_id=f"driver-{driver_id}"   # aísla el consumo por cliente
     )
+
 
     await producer.start()
     await consumer.start()
-    print(f"🚗 EV_Driver listo → broker={broker} | driver={driver_id}")
+    print(f"🚗 EV_Driver listo → broker={broker} | driver={driver_id} | servicios={len(cp_ids)}")
 
     try:
         for cp in cp_ids:
@@ -31,9 +34,16 @@ async def run(broker, driver_id, cp_ids):
             )
             print(f"📨 Solicitud enviada → CP={cp} | request_id={req_id}")
 
-            # 2) Esperar respuestas de esta solicitud (updates + telemetrías)
-            while True:
-                msg = await consumer.getone()
+            # 2) Esperar respuestas de esta solicitud (updates + telemetrías) con timeout
+            loop = asyncio.get_running_loop()
+            end_time = loop.time() + 180  # 180 s de timeout por servicio
+
+            while loop.time() < end_time:
+                try:
+                    msg = await asyncio.wait_for(consumer.getone(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
                 data = msg.value
 
                 # Filtrar estrictamente por este driver y este request
@@ -41,7 +51,7 @@ async def run(broker, driver_id, cp_ids):
                     continue
 
                 if msg.topic == "driver.update":
-                    status = data.get("status")
+                    status = (data.get("status") or "").upper()
                     message = data.get("message", "")
                     print(f"🔔 Update: {status} — {message}")
 
@@ -51,11 +61,14 @@ async def run(broker, driver_id, cp_ids):
 
                     if status == "FINISHED":
                         # Ticket final (resumen)
-                        summary = data.get("summary", {})
+                        summary = data.get("summary", {}) or {}
                         kwh = summary.get("kwh")
                         eur = summary.get("amount_eur")
                         reason = summary.get("reason", "ENDED")
-                        print(f"✅ Carga finalizada en {cp} → {kwh} kWh | {eur} € (reason={reason})")
+                        try:
+                            print(f"✅ Carga finalizada en {cp} → {kwh:.4f} kWh | {eur:.3f} € (reason={reason})")
+                        except Exception:
+                            print(f"✅ Carga finalizada en {cp} → {kwh} kWh | {eur} € (reason={reason})")
                         break
 
                 elif msg.topic == "driver.telemetry":
@@ -63,7 +76,14 @@ async def run(broker, driver_id, cp_ids):
                     kw = data.get("kw")
                     kwh_total = data.get("kwh_total")
                     eur_total = data.get("eur_total")
-                    print(f"⚡ {cp} → {kw} kW | {kwh_total} kWh | {eur_total:.2f} €")
+                    try:
+                        print(f"⚡ {cp} → {kw} kW | {kwh_total:.4f} kWh | {eur_total:.2f} €")
+                    except Exception:
+                        print(f"⚡ {cp} → {kw} kW | {kwh_total} kWh | {eur_total} €")
+            else:
+                print("⏱️  Timeout esperando conclusión; continúo con el siguiente tras 4 s…")
+
+
 
             # 3) Pausa de 4 s entre solicitudes (requisito de la práctica)
             await asyncio.sleep(4)
@@ -81,7 +101,13 @@ def main():
 
     if len(sys.argv) >= 4:
         with open(sys.argv[3], "r", encoding="utf-8") as f:
-            cp_ids = [line.strip() for line in f if line.strip()]
+            cp_ids = []
+            for line in f:
+                t = line.strip()
+                if not t or t.startswith("#"):
+                    continue
+                cp_ids.append(t)
+
     else:
         cp = input("CP a solicitar: ").strip()
         cp_ids = [cp]

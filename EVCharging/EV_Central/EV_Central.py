@@ -300,6 +300,23 @@ def monitor_socket_server(loop):
                 health = (msg.get("health") or "KO").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
 
+                # Si el CP entra en KO mientras está SUMINISTRANDO → STOP inmediato
+                try:
+                    cur = get_cp_from_db(cp_id)
+                    cur_status = (cur.get("status") if cur else "DESCONECTADO").upper()
+                except Exception:
+                    cur_status = "DESCONECTADO"
+
+                if health == "KO" and cur_status == "SUMINISTRANDO":
+                    # Publica STOP para ese CP vía Kafka (desde este hilo: run_coroutine_threadsafe)
+                    asyncio.run_coroutine_threadsafe(
+                        kafka_producer.send_and_wait(
+                            "central.command",
+                            json.dumps({"action": "STOP", "cp_id": cp_id}).encode()
+                        ),
+                        loop
+                    )
+
                 # No machacar PARADO con ACTIVADO por un heartbeat
                 cur = get_cp_from_db(cp_id)
                 cur_status = (cur.get("status") if cur else "DESCONECTADO").upper()
@@ -397,8 +414,16 @@ async def consume_kafka():
             cp_id = data.get("cp_id")
 
             if topic == "cp.register":
-                # Registro de Engine (vía Kafka) — redundante con monitor, pero compatible
-                insert_cp(cp_id, data.get("location", "Desconocida"), float(data.get("kwh", 0.30)))
+                # Registro de Engine (vía Kafka)
+                price = data.get("price")
+                if price is None:
+                    # compatibilidad con versiones que enviaban "kwh" como precio
+                    price = data.get("kwh", 0.30)
+                insert_cp(
+                    cp_id,
+                    data.get("location", "Desconocida"),
+                    float(price)
+                )
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
 
             elif topic == "cp.status":

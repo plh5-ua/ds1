@@ -1,0 +1,12 @@
+# Fichero de pruebas con casos "raros": espacios, comentarios y líneas vacías
+   
+# comentario al principio
+CP-ALICANTE-01
+
+# línea en blanco arriba y abajo
+
+
+CP-ALICANTE-02   # comentario al final de línea (lo verás completo; tu parser ignora solo las líneas que empiezan por #)
+
+   CP-ALICANTE-03
+# fin

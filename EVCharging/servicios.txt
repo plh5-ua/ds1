@@ -1,0 +1,9 @@
+# Lista de CPs a solicitar por el Driver (uno por línea)
+# Líneas en blanco y comentarios (#) se ignoran.
+# Asegúrate de lanzar tus monitores (EV_CP_M) con estos mismos IDs.
+
+CP-ALICANTE-01
+CP-ALICANTE-02
+
+# Puedes añadir más:
+CP-ALICANTE-03
