@@ -415,7 +415,7 @@ def monitor_socket_server(loop):
                 pass
 
 async def monitor_disconnections():
-    """🧠 Marca CPs como DESCONECTADOS si no envían heartbeats recientes."""
+    """ Marca CPs como DESCONECTADOS si no envían heartbeats recientes."""
     while True:
         now = asyncio.get_running_loop().time()
         for cp_id, last in list(LAST_HEARTBEAT.items()):

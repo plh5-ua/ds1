@@ -25,12 +25,14 @@ cd %KAFKA_HOME%
 Despliegue:
 #EV_Central:
 cd /d D:\sd1\ds1\ds1\EVCharging\EV_Central
-python EV_Central.py 8080 192.168.56.1:9092 127.0.0.1:0
+python EV_Central.py 8080 localhost:9092
 
 
 EV_CP_E:
 cd /d D:\sd1\ds1\ds1\EVCharging\EV_CP_E
 python EV_CP_E.py 192.168.56.1:9092 6001
+python EV_CP_E.py 127.0.0.1:9092 6001
+(depende de si kafka está en la máquina o en otra)
 
 EV_CP_M:
 cd /d D:\sd1\ds1\ds1\EVCharging\EV_CP_M
@@ -38,7 +40,10 @@ cd /d D:\sd1\ds1\ds1\EVCharging\EV_CP_M
 
 python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <id_cp> <location> <price>
 
-python EV_CP_M.py 127.0.0.1:6001 127.0.0.1:9000 1 Parking_A 0.45
+python EV_CP_M.py 127.0.0.1:6001 127.0.0.1:9000 CP-ALICANTE-02 "Alicante Norte" 0.30
+
+# Lanzar el Driver (con fichero de CPs)
+python EV_Driver.py 127.0.0.1:9092 user servicios.txt
 
 
 API:

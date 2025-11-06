@@ -73,14 +73,14 @@ async def heartbeat_loop():
 # -------------------------------------------------------------
 async def main():
     print(f"🩺 EV_CP_M {CP_ID} iniciado | Engine: {ENGINE_ADDR} | Central: {CENTRAL_ADDR}")
-    # 1️⃣ Registrar en CENTRAL
+    # 1 Registrar en CENTRAL
     send_to_central({
         "action": "REGISTER",
         "cp_id": CP_ID,
         "location": LOCATION,
         "price": PRICE
     })
-    # 2️⃣ Enviar ID al Engine
+    # 2️ Enviar ID al Engine
     if send_id_to_engine():
         print(f"✅ Engine confirmó ACK para {CP_ID}. Iniciando heartbeats...")
         await heartbeat_loop()
