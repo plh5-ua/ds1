@@ -296,11 +296,21 @@ def monitor_socket_server(loop):
                 )
 
             elif action == "HEARTBEAT":
-                # registrar la hora del último heartbeat recibido
                 LAST_HEARTBEAT[cp_id] = loop.time()
-
                 health = (msg.get("health") or "KO").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
+
+                # No machacar PARADO con ACTIVADO por un heartbeat
+                cur = get_cp_from_db(cp_id)
+                cur_status = (cur.get("status") if cur else "DESCONECTADO").upper()
+                if new_status == "ACTIVADO" and cur_status in {"PARADO", "DESCONECTADO"}:
+                    try:
+                        conn.sendall(health.encode())
+                    except Exception:
+                        pass
+                    continue
+
+                # Evitar pasar a ACTIVADO si está suministrando ya lo controlas con is_suministrando_cp
                 if new_status == "ACTIVADO" and is_suministrando_cp(cp_id):
                     pass
                 else:
@@ -309,11 +319,13 @@ def monitor_socket_server(loop):
                     cp_data["status"] = new_status
                     asyncio.run_coroutine_threadsafe(
                         notify_panel({"type": "heartbeat", **cp_data}), loop,
-                )
+                    )
+
                 try:
                     conn.sendall(health.encode())
                 except Exception:
                     pass
+
 
             else:
                 try:
@@ -390,8 +402,14 @@ async def consume_kafka():
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
 
             elif topic == "cp.status":
-                update_cp(cp_id, data.get("status", "ACTIVADO"))
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
+                status = data.get("status", "ACTIVADO")
+                update_cp(cp_id, status)
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": status})
+
+                # Si el CP ya no está suministrando, aseguramos liberar la sesión en memoria
+                # if status != "SUMINISTRANDO":
+                #    ACTIVE_SESSIONS.pop(cp_id, None)
+
 
             elif topic == "cp.heartbeat":
                 # Si un Engine publica health por Kafka (además del monitor)
@@ -480,27 +498,36 @@ async def consume_kafka():
 
             elif topic == "cp.session_ended":
                 sess = ACTIVE_SESSIONS.pop(cp_id, None)
-                summary = {
-                    "kwh": data.get("kwh"),
-                    "amount_eur": data.get("amount_eur"),
-                    "reason": data.get("reason", "ENDED")
-                }
+                reason = (data.get("reason") or "ENDED").upper()
 
-                # Liberar CP y notificar panel
-                update_cp(cp_id, "ACTIVADO")
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
+                # Si fue STOP/ABORTED, el CP debe quedar PARADO
+                new_status = "PARADO" if reason == "ABORTED" else "ACTIVADO"
+                update_cp(cp_id, new_status)
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
 
                 if sess:
-                    end_session(sess["session_id"], summary["kwh"], summary["amount_eur"],
-                                "ENDED" if summary["reason"] == "ENDED" else "ABORTED")
-                    log_event(cp_id, sess["driver_id"], "END", summary)
+                    end_session(
+                        sess["session_id"],
+                        data.get("kwh"),
+                        data.get("amount_eur"),
+                        "ENDED" if reason == "ENDED" else "ABORTED"
+                    )
+                    log_event(cp_id, sess["driver_id"], "END", {
+                        "kwh": data.get("kwh"),
+                        "amount_eur": data.get("amount_eur"),
+                        "reason": reason
+                    })
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
                         "driver_id": sess["driver_id"],
                         "request_id": sess["request_id"],
                         "status": "FINISHED",
                         "message": f"Servicio finalizado en {cp_id}",
-                        "summary": summary
+                        "summary": {"kwh": data.get("kwh"),
+                                    "amount_eur": data.get("amount_eur"),
+                                    "reason": reason}
                     }).encode())
+
+
 
     finally:
         await kafka_consumer.stop()

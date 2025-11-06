@@ -20,6 +20,8 @@ STATUS = "DESCONECTADO"
 PRICE = round(random.uniform(0.40, 0.70), 2)
 HEALTH = "OK"  # para HEARTBEAT
 STOP = asyncio.Event()  # señal de parada limpia
+CHARGE_TASK = None  # asyncio.Task | None
+
 
 # -------------------------------------------------------------
 # CONTROL DESDE TECLADO (para simular KO/OK)
@@ -55,7 +57,7 @@ async def send_status(producer: AIOKafkaProducer, status: str):
 
 async def start_charging(producer: AIOKafkaProducer):
     """Simula una sesión de carga y envía telemetrías periódicas a CENTRAL, cancelable con STOP."""
-    global STATUS
+    global STATUS, CHARGE_TASK
     STATUS = "SUMINISTRANDO"
     await send_status(producer, STATUS)
 
@@ -93,8 +95,10 @@ async def start_charging(producer: AIOKafkaProducer):
     }
     await producer.send_and_wait("cp.session_ended", json.dumps(end_msg).encode())
 
-    await send_status(producer, "ACTIVADO")
+    # Si hemos abortado por STOP, el CP queda PARADO; si no, vuelve a ACTIVADO
+    await send_status(producer, "PARADO" if STOP.is_set() else "ACTIVADO")
     print("✅ Carga finalizada.")
+    CHARGE_TASK = None
 
 # -------------------------------------------------------------
 # SERVIDOR TCP ASÍNCRONO (Monitor ↔ Engine)
@@ -192,44 +196,45 @@ async def start_socket_server(producer: AIOKafkaProducer):
 # -------------------------------------------------------------
 # ESCUCHA A CENTRAL (Kafka)
 # -------------------------------------------------------------
-async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProducer):
+async def listen_to_central(consumer, producer):
+    global CHARGE_TASK
     print("👂 Esperando mensajes de CENTRAL...")
     try:
         async for msg in consumer:
-            if STOP.is_set():
-                break
+            
             data = msg.value
 
-            # filtrar por CP correcto
-            if CP_ID is None or data.get("cp_id") != CP_ID:
-                continue
-            # Dentro del handler que procesa mensajes de "central.authorize"
-            print(f"[{ENGINE_PORT}] authorize recibido:", data, "| CP_ID_local=", CP_ID)
-
             if msg.topic == "central.authorize":
+                # 1) Solo si es para este CP
+                if data.get("cp_id") != CP_ID:
+                    continue
+                # 2) No aceptes authorize si el CP no está ACTIVADO o está en STOP
+                if STOP.is_set() or STATUS != "ACTIVADO":
+                    print("⛔ Ignoro authorize: CP no disponible (PARADO/NO ACTIVO).")
+                    continue
+                # 3) Evitar duplicar sesiones si ya está suministrando (por si llegan dobles)
+                if STATUS == "SUMINISTRANDO" or (CHARGE_TASK and not CHARGE_TASK.done()):
+                    print("ℹ️ Ya estaba suministrando; ignoro authorize duplicado.")
+                    continue
+
                 print("🔔 Autorizado suministro por CENTRAL")
-                await start_charging(producer)
+                CHARGE_TASK = asyncio.create_task(start_charging(producer))
+
+
             elif msg.topic == "central.command":
                 action = data.get("action", "").upper()
                 target = data.get("cp_id", "ALL")
                 print(f"⚙️ Orden recibida desde CENTRAL: {action} → {target}")
 
-                # Aplica si el comando es global o para este CP concreto
+                # aquí aceptamos global o dirigido a este CP
                 if target != "ALL" and target != CP_ID:
                     continue
 
                 if action == "STOP":
-                    STOP.set()  # detiene carga si está en curso
+                    STOP.set()
+                    if CHARGE_TASK and not CHARGE_TASK.done():
+                        pass
                     await send_status(producer, "PARADO")
-                    # Notificar fin de sesión (si estaba suministrando)
-                    end_msg = {
-                        "cp_id": CP_ID,
-                        "session_id": 1,
-                        "kwh": 0.0,
-                        "amount_eur": 0.0,
-                        "reason": "ABORTED"
-                    }
-                    await producer.send_and_wait("cp.session_ended", json.dumps(end_msg).encode())
                     print(f"🛑 Carga detenida por CENTRAL en {CP_ID}")
 
                 elif action == "RESUME":
