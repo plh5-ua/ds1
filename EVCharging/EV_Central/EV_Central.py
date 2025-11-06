@@ -28,6 +28,12 @@ from pydantic import BaseModel
 # --- Kafka asíncrono ---
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
+# ---------------------------------------------------------------------------
+# Monitoreo de heartbeats
+# ---------------------------------------------------------------------------
+LAST_HEARTBEAT = {}
+HEARTBEAT_TIMEOUT = 3  # segundos sin recibir heartbeat → DESCONECTADO
+
 
 # ---------------------------------------------------------------------------
 # ARGUMENTOS DE EJECUCIÓN
@@ -85,6 +91,14 @@ def insert_cp(cp_id: str, location: str, price: float = 0.3):
             )
         con.commit()
 
+def is_suministrando_cp(cp_id: str) -> bool:
+    with closing(get_db()) as con:
+        cur = con.cursor()
+        row = cur.execute("SELECT status FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+    if row is None:
+        return False  
+    status = row[0] 
+    return status.upper() == "SUMINISTRANDO"
 
 def update_cp(cp_id: str, status: str):
     with closing(get_db()) as con:
@@ -101,6 +115,13 @@ def list_cps():
         rows = con.execute("SELECT * FROM charging_points").fetchall()
         return [dict(r) for r in rows]
 
+def mark_all_cps_disconnected():
+    """Marca todos los puntos como DESCONECTADOS al iniciar CENTRAL."""
+    with closing(get_db()) as con:
+        cur = con.cursor()
+        cur.execute("UPDATE charging_points SET status='DESCONECTADO', updated_at=CURRENT_TIMESTAMP")
+        con.commit()
+    print("🔘 Todos los puntos de recarga marcados como DESCONECTADOS al iniciar CENTRAL.")
 
 def get_cp_from_db(cp_id):
     with closing(get_db()) as con:
@@ -275,13 +296,19 @@ def monitor_socket_server(loop):
                 )
 
             elif action == "HEARTBEAT":
+                # registrar la hora del último heartbeat recibido
+                LAST_HEARTBEAT[cp_id] = loop.time()
+
                 health = (msg.get("health") or "KO").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
-                update_cp(cp_id, new_status)
-                cp_data = get_cp_from_db(cp_id) or {"id": cp_id, "status": new_status}
-                cp_data["status"] = new_status
-                asyncio.run_coroutine_threadsafe(
-                    notify_panel({"type": "heartbeat", **cp_data}), loop,
+                if new_status == "ACTIVADO" and is_suministrando_cp(cp_id):
+                    pass
+                else:
+                    update_cp(cp_id, new_status)
+                    cp_data = get_cp_from_db(cp_id) or {"id": cp_id, "status": new_status}
+                    cp_data["status"] = new_status
+                    asyncio.run_coroutine_threadsafe(
+                        notify_panel({"type": "heartbeat", **cp_data}), loop,
                 )
                 try:
                     conn.sendall(health.encode())
@@ -302,6 +329,21 @@ def monitor_socket_server(loop):
             except Exception:
                 pass
 
+async def monitor_disconnections():
+    """🧠 Marca CPs como DESCONECTADOS si no envían heartbeats recientes."""
+    while True:
+        now = asyncio.get_running_loop().time()
+        for cp_id, last in list(LAST_HEARTBEAT.items()):
+            if now - last > HEARTBEAT_TIMEOUT:
+                print(f"⚠️ CP {cp_id} no ha mandado heartbeat en {HEARTBEAT_TIMEOUT}s → DESCONECTADO")
+                update_cp(cp_id, "DESCONECTADO")
+                cp_data = get_cp_from_db(cp_id)
+                if cp_data:
+                    cp_data["status"] = "DESCONECTADO"
+                    await notify_panel({"type": "heartbeat", **cp_data})
+                # eliminar para no repetir
+                del LAST_HEARTBEAT[cp_id]
+        await asyncio.sleep(2)
 
 # ---------------------------------------------------------------------------
 # KAFKA (Engines y Drivers)
@@ -477,6 +519,9 @@ async def produce_kafka():
 async def main():
     init_db()
 
+    # Al iniciar, marcar todos los CPs como DESCONECTADOS
+    mark_all_cps_disconnected()
+
     # Hilo para servidor de monitores (socket bloqueante)
     loop = asyncio.get_running_loop()
     threading.Thread(target=monitor_socket_server, args=(loop,), daemon=True).start()
@@ -484,6 +529,10 @@ async def main():
     # Kafka
     asyncio.create_task(produce_kafka())
     asyncio.create_task(consume_kafka())
+
+
+    # Tarea de control de desconexiones de CP
+    asyncio.create_task(monitor_disconnections())
 
     # HTTP + WS del panel
     config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
