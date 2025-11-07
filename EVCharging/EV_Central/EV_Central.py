@@ -448,7 +448,6 @@ async def consume_kafka():
     kafka_consumer = AIOKafkaConsumer(
         "cp.heartbeat",
         "cp.status",
-        "cp.register",
         "cp.telemetry",
         "cp.session_ended",
         "driver.request",
@@ -472,22 +471,7 @@ async def consume_kafka():
             location = data.get("location")
             price = data.get("kwh", 0.30)
 
-            if topic == "cp.register":
-                # Registro de Engine (vía Kafka)
-                price = data.get("price")
-                if price is None:
-                    # compatibilidad con versiones que enviaban "kwh" como precio
-                    price = data.get("kwh", 0.30)
-                insert_cp(
-                    cp_id,
-                    data.get("location", "Desconocida"),
-                    float(price)
-                )
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": data.get("status", "ACTIVADO")})
-                log_central_msg("REGISTER", {"cp_id": cp_id, "location": location, "price": price})
-
-
-            elif topic == "cp.status":
+            if topic == "cp.status":
                 status = data.get("status", "ACTIVADO")
                 update_cp(cp_id, status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": status})
