@@ -143,10 +143,9 @@ async def handle_monitor_connection(
             print(f"✅ Recibido ID {CP_ID} y ubicación {CP_LOCATION}")
             writer.write(b"ACK")
             await writer.drain()
-            await register_cp(producer)
+
             await send_status(producer, "ACTIVADO")
             return
-
         # Acciones del monitor
         if "action" in payload:
             action = payload["action"].upper()
