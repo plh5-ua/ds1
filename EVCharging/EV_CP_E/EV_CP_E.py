@@ -64,11 +64,11 @@ async def start_charging(producer: AIOKafkaProducer):
     kwh = 0.0
     print(f"⚡ Iniciando carga en {CP_ID} (Precio: {PRICE} €/kWh)")
 
-    for _ in range(10):
+    for _ in range(50):
         if STOP.is_set():
             break
         kw = round(random.uniform(6.0, 7.5), 2)
-        kwh += kw / 3600  * 60 * 10 #SIMULAMOS CARGA 10 MINUTOS POR SEGUNDO
+        kwh += kw / 3600  * 60 * 5 #SIMULAMOS CARGA 5 MINUTOS POR SEGUNDO
         amount = round(kwh * PRICE, 3)
         telem = {
             "cp_id": CP_ID,
