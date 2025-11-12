@@ -1,5 +1,13 @@
 PRAGMA foreign_keys = ON;
 
+
+DROP TABLE IF EXISTS charging_points;
+DROP TABLE IF EXISTS drivers;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS events;
+DROP INDEX IF EXISTS idx_sessions_cp;
+DROP INDEX IF EXISTS idx_events_cp;
+
 -- Tabla de puntos de recarga (Charging Points)
 CREATE TABLE IF NOT EXISTS charging_points (
     id TEXT PRIMARY KEY,
