@@ -346,22 +346,21 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
                 action = (data.get("action") or "").upper()
                 target = data.get("cp_id", "ALL")
 
-                # ⬅️ 1) Si todavía no sé qué CP soy, ignoro los comandos
+                # 1) Si todavía no sé qué CP soy, ignoro los comandos
                 if CP_ID is None:
                     # aún no he recibido el registro del monitor
                     continue
 
-                # ⬅️ 2) Si el comando no es para mí ni es ALL → ignorar
+                # 2) Si el comando no es para mí ni es ALL → ignorar
                 if target not in ("ALL", CP_ID):
                     continue
 
                 if action == "STOP":
                     STOP.set()
 
-                    # Si estoy suministrando, dejo que start_charging cierre sesión (ABORTED)
+                    # Si estoy suministrando, dejo que start_charging cierre sesión 
                     if STATUS == "SUMINISTRANDO" and CHARGE_TASK and not CHARGE_TASK.done():
                         print(f"Carga detenida por CENTRAL en {CP_ID}")
-                        # NO cambiamos STATUS aquí, lo hará cp.session_ended desde CENTRAL
                     else:
                         # Si no estaba cargando, solo pongo en PARADO si no lo estaba ya
                         if STATUS != "PARADO":
