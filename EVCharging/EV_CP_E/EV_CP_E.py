@@ -1,6 +1,9 @@
 import asyncio, json, sys, random, threading, uuid
 from collections import deque
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from uuid import uuid4
+
+
 
 # -------------------------------------------------------------
 # ARGUMENTOS
@@ -22,7 +25,8 @@ PRICE = round(random.uniform(0.40, 0.70), 2)
 HEALTH = "OK"               # expuesto vía HEARTBEAT local
 STOP = asyncio.Event()      # señal para detener carga
 CHARGE_TASK = None          # asyncio.Task | None
-
+GROUP_ID  = f"engine-{ENGINE_PORT}"                
+CLIENT_ID = f"{GROUP_ID}-{uuid4().hex[:6]}"         # evita colisiones de client.id
 # Entrada de usuario (único lector)
 INPUT_Q: asyncio.Queue[str] = asyncio.Queue()
 PROMPT_FUT: asyncio.Future | None = None
@@ -370,13 +374,23 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
 # MAIN
 # -------------------------------------------------------------
 async def main():
-    producer = AIOKafkaProducer(bootstrap_servers=BROKER)
+    producer = AIOKafkaProducer(
+        bootstrap_servers=BROKER,
+        client_id=CLIENT_ID,
+        request_timeout_ms=30000,
+    )
     consumer = AIOKafkaConsumer(
         "driver.request", "central.authorize", "central.command",
         bootstrap_servers=BROKER,
         value_deserializer=lambda b: json.loads(b.decode()),
-        group_id=f"engine-{ENGINE_PORT}",
-        auto_offset_reset="latest"
+        group_id=GROUP_ID,
+        client_id=CLIENT_ID,
+        auto_offset_reset="latest",
+        enable_auto_commit=False,             
+        session_timeout_ms=20000,              
+        heartbeat_interval_ms=3000,
+        request_timeout_ms=30000,
+        max_poll_interval_ms=300000,
     )
 
     await producer.start()

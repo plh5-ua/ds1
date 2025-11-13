@@ -36,7 +36,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 # Monitoreo de heartbeats
 # ---------------------------------------------------------------------------
 LAST_HEARTBEAT = {}
-HEARTBEAT_TIMEOUT = 2.5  # segundos sin recibir heartbeat → DESCONECTADO
+HEARTBEAT_TIMEOUT = 3.2  # segundos sin recibir heartbeat → DESCONECTADO
 LAST_STATUS_SEEN = {}
 # Última telemetría por CP para exponerla en /cp y en el panel
 LAST_TELEMETRY: Dict[str, Dict[str, Any]] = {}
@@ -58,7 +58,7 @@ HTTP_PORT = int(sys.argv[1])
 KAFKA_BOOTSTRAP = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:9092"
 SOCKET_PORT = 9000  # puerto para monitores
 
-print("🔌 Iniciando EV_Central ...")
+print("Iniciando EV_Central ...")
 print(f"  • Puerto HTTP: {HTTP_PORT}")
 print(f"  • Broker Kafka: {KAFKA_BOOTSTRAP}")
 print(f"  • Puerto SOCKET monitores: {SOCKET_PORT}")
