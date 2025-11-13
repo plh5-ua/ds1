@@ -55,7 +55,7 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 HTTP_PORT = int(sys.argv[1])
-KAFKA_BOOTSTRAP = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:9092"
+KAFKA_BOOTSTRAP = sys.argv[2]
 SOCKET_PORT = 9000  # puerto para monitores
 
 print("Iniciando EV_Central ...")
@@ -401,7 +401,6 @@ def monitor_socket_server(loop):
                         conn.sendall(health.encode())
                     except Exception:
                         pass
-                    # Actualiza "visto" para no spamear logs si sigue viniendo OK
                     LAST_STATUS_SEEN[cp_id] = prev_status
                     return
 
@@ -440,7 +439,7 @@ def monitor_socket_server(loop):
                 except Exception: pass
 
         except Exception as e:
-            print(f"⚠️ Error procesando monitor desde {addr}: {e}")
+            print(f"Error procesando monitor desde {addr}: {e}")
         finally:
             try: conn.close()
             except Exception: pass
@@ -542,7 +541,6 @@ async def force_close_session(cp_id: str, reason_code: str):
 async def consume_kafka():
     global kafka_consumer
     kafka_consumer = AIOKafkaConsumer(
-        "cp.heartbeat",
         "cp.status",
         "cp.telemetry",
         "cp.session_ended",
@@ -572,14 +570,23 @@ async def consume_kafka():
             if topic == "cp.status":
                 status = (data.get("status") or "ACTIVADO").upper()
 
+                # Si CENTRAL está en STOP, no aceptar transiciones a ACTIVADO
+                if CENTRAL_STATUS == "STOP" and status == "ACTIVADO":
+                    # Mantener PARADO (o el estado actual si es más restrictivo)
+                    row = get_cp_from_db(cp_id) or {}
+                    cur = (row.get("status") or "DESCONECTADO").upper()
+                    status = "PARADO" if cur not in {"AVERIA", "DESCONECTADO"} else cur
+                    log_central_msg("STOP_GLOBAL_FILTER",
+                                    {"cp_id": cp_id, "kept": status, "ignored": "ACTIVADO"})
+
                 # Si estaba suministrando y el nuevo estado no permite suministro → cerrar
                 if status in {"AVERIA", "PARADO", "DESCONECTADO"} and cp_id in ACTIVE_SESSIONS:
-                    # Elige un código de cierre coherente
                     reason_code = "FAULT" if status == "AVERIA" else ("DISCONNECTED" if status == "DESCONECTADO" else "ABORTED")
                     await force_close_session(cp_id, reason_code)
 
                 update_cp(cp_id, status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": status})
+
 
 
             elif topic == "driver.request":
@@ -623,8 +630,6 @@ async def consume_kafka():
                 }
                 log_event(req_cp, req_driver, "AUTH", {"request_id": req_id})
 
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # Añadidos para la tabla "Sesiones iniciadas" y "Últimos 5 mensajes"
                 started_item = {
                     "ts": now_iso(),           # helper que devuelve fecha/hora
                     "cp_id": req_cp,
@@ -635,7 +640,6 @@ async def consume_kafka():
                 log_central_msg("SUMINISTRO_SOLICITADO", {                         # mensaje central
                     "cp_id": req_cp, "driver_id": req_driver, "session_id": session_id
                 })
-                # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
                 # 4) Avisar a Engine y Driver
                 await kafka_producer.send_and_wait("central.authorize", json.dumps({

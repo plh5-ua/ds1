@@ -36,11 +36,10 @@ AVAILABLE_DRIVERS = deque(maxlen=50)   # [{'driver_id','request_id','cp_id','ts'
 PENDING_AUTH = None                    # {'driver_id','request_id','cp_id'}
 
 # -------------------------------------------------------------
-# UTILIDADES DE TECLADO (no bloqueantes)
+# UTILIDADES DE TECLADO 
 # -------------------------------------------------------------
 def stdin_reader(loop: asyncio.AbstractEventLoop):
-    """Único lector de stdin. Si hay un ask() esperando, le entrega la línea;
-       si no, la manda a la cola de comandos del menú."""
+    """Único lector de stdin. Con esto evitamos bloqueos en el loop."""
     global PROMPT_FUT
     while True:
         try:
@@ -125,7 +124,6 @@ async def start_charging(producer: AIOKafkaProducer):
     if STOP.is_set():
         reason = "ABORTED"
     else:
-        # Confirmación de fin solo si no hubo STOP
         while True:
             resp = (await ask(f"¿Confirmar fin de carga en CP {CP_ID}? (s/n): ")).lower()
             if resp == "s":
@@ -173,7 +171,7 @@ async def menu_loop(producer: AIOKafkaProducer):
 
         elif cmd == "2":
             HEALTH = "KO"
-            STOP.set()                         # ⬅️ imprescindible para parar la carga en curso
+            STOP.set()                         
             await send_status(producer, "PARADO")
             print("CP en KO (status PARADO).")
 
@@ -246,14 +244,19 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
         except Exception:
             writer.write(b"NACK"); await writer.drain(); return
 
-        # Registro inicial
+        # Registro inicial 
         if "cp_id" in payload and "location" in payload:
             CP_ID = payload["cp_id"]
             CP_LOCATION = payload["location"]
             print(f"Recibido ID {CP_ID} y ubicación {CP_LOCATION}")
             writer.write(b"ACK"); await writer.drain()
-            await send_status(producer, "ACTIVADO")
+
+            # Solo activar si el Engine está sano y NO hay STOP activo
+            desired = "ACTIVADO" if (HEALTH == "OK" and not STOP.is_set()) else "PARADO"
+            await send_status(producer, desired)
             return
+
+
 
         # Acciones locales
         if "action" in payload:
@@ -267,7 +270,7 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
                 STOP.clear()
                 await send_status(producer, "ACTIVADO")
                 writer.write(b"OK"); await writer.drain(); return
-            elif action == "SUMINISTRAR":
+            elif action == "SUMINISTRAR": 
                 # Demo local (sin autorización CENTRAL)
                 if not (CHARGE_TASK and not CHARGE_TASK.done()):
                     CHARGE_TASK = asyncio.create_task(start_charging(producer))
@@ -309,8 +312,8 @@ async def start_socket_server(producer: AIOKafkaProducer):
 # ESCUCHA A CENTRAL (Kafka)
 # -------------------------------------------------------------
 async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProducer):
-    global CHARGE_TASK, PENDING_AUTH
-    print("Esperando mensajes de CENTRAL...")
+    global CHARGE_TASK, PENDING_AUTH, STATUS, CP_ID, STOP
+    print("👂 Esperando mensajes de CENTRAL...")
     try:
         async for msg in consumer:
             data = msg.value
@@ -338,34 +341,41 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
                 print("Autorización recibida para este CP. Usa 4) Aceptar o 5) Rechazar.")
                 continue
 
-            # STOP / RESUME
+            # STOP / RESUME desde CENTRAL
             if msg.topic == "central.command":
                 action = (data.get("action") or "").upper()
                 target = data.get("cp_id", "ALL")
 
-                # ¿Me aplica este comando?
+                # ⬅️ 1) Si todavía no sé qué CP soy, ignoro los comandos
+                if CP_ID is None:
+                    # aún no he recibido el registro del monitor
+                    continue
+
+                # ⬅️ 2) Si el comando no es para mí ni es ALL → ignorar
                 if target not in ("ALL", CP_ID):
                     continue
 
                 if action == "STOP":
-                    # Siempre marca STOP y publica PARADO (idempotente)
                     STOP.set()
-                    await send_status(producer, "PARADO")
 
-                    # Mensaje solo informativo
-                    if CHARGE_TASK and not CHARGE_TASK.done():
+                    # Si estoy suministrando, dejo que start_charging cierre sesión (ABORTED)
+                    if STATUS == "SUMINISTRANDO" and CHARGE_TASK and not CHARGE_TASK.done():
                         print(f"Carga detenida por CENTRAL en {CP_ID}")
+                        # NO cambiamos STATUS aquí, lo hará cp.session_ended desde CENTRAL
                     else:
+                        # Si no estaba cargando, solo pongo en PARADO si no lo estaba ya
+                        if STATUS != "PARADO":
+                            await send_status(producer, "PARADO")
                         print(f"(Aviso) STOP recibido en {CP_ID}")
 
                 elif action == "RESUME":
                     STOP.clear()
-                    # Si no estamos suministrando, déjalo listo
-                    if STATUS != "SUMINISTRANDO":
+                    # Solo mandamos ACTIVADO si no lo estaba ya
+                    if STATUS != "ACTIVADO":
                         await send_status(producer, "ACTIVADO")
-                    print(f"CP {CP_ID} marcado como ACTIVADO por CENTRAL")
+                        print(f"CP {CP_ID} marcado como ACTIVADO por CENTRAL")
 
-
+                continue  
 
     except asyncio.CancelledError:
         pass
