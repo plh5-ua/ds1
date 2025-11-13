@@ -69,17 +69,43 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
                 # Rechazado o error → concluimos esta solicitud
                 break
 
-            if status == "FINISHED":
-                # Ticket final
-                summary = data.get("summary", {}) or {}
-                kwh = summary.get("kwh")
-                eur = summary.get("amount_eur")
-                reason = summary.get("reason", "ENDED")
+        if status == "FINISHED":
+            summary = data.get("summary", {}) or {}
+            kwh = summary.get("kwh")
+            eur = summary.get("amount_eur")
+            reason = summary.get("reason", "ENDED")
+            loc = summary.get("location", "Desconocida")
+            unit_price = summary.get("price_eur_kwh")
+            cp_from_summary = summary.get("cp_id", cp)
+
+            # Fallback de cálculo si amount_eur no vino y tenemos precio
+            if eur is None and (kwh is not None) and (unit_price is not None):
                 try:
-                    print(f"✅ Carga finalizada en {cp} → {kwh:.4f} kWh | {eur:.3f} € (reason={reason})")
+                    eur = round(float(kwh) * float(unit_price), 2)
                 except Exception:
-                    print(f"✅ Carga finalizada en {cp} → {kwh} kWh | {eur} € (reason={reason})")
-                break
+                    pass
+
+            print("\n===== TICKET DE RECARGA =====")
+            print(f"CP:           {cp_from_summary}")
+            print(f"Localización: {loc}")
+            if unit_price is not None:
+                print(f"Precio/kWh:   {unit_price} €")
+            if kwh is not None:
+                try:
+                    print(f"Energía:      {float(kwh):.4f} kWh")
+                except Exception:
+                    print(f"Energía:      {kwh} kWh")
+            if eur is not None:
+                try:
+                    print(f"Importe:      {float(eur):.2f} €")
+                except Exception:
+                    print(f"Importe:      {eur} €")
+            print(f"Estado:       {reason}")
+            print("=============================\n")
+
+            # Mantén el break para cerrar el bucle de espera de esta solicitud
+            break
+
 
         elif msg.topic == "driver.telemetry":
             # Progreso en tiempo real
@@ -178,8 +204,7 @@ def main():
     broker = sys.argv[1]
     driver_id = sys.argv[2]
 
-    # Si hay 3er argumento, usar ese fichero.
-    # Si no, preguntar por terminal (Enter → interactivo).
+
     cp_ids = None
     if len(sys.argv) >= 4:
         cp_ids = leer_fichero_cps(sys.argv[3])
@@ -195,7 +220,7 @@ def main():
     try:
         asyncio.run(run(broker, driver_id, cp_ids))
     except KeyboardInterrupt:
-        print("\n🛑 Cancelado por el usuario.")
+        print("\n Cancelado por el usuario.")
 
 if __name__ == "__main__":
     main()

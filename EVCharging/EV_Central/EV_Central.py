@@ -349,7 +349,7 @@ def monitor_socket_server(loop):
                 asyncio.run_coroutine_threadsafe(
                     notify_panel({"type": "register", **cp_data}), loop,
                 )
-                log_central_msg("REGISTER", {"cp_id": cp_id, "location": location, "price": price})
+                log_central_msg("REGISTRO_CP", {"cp_id": cp_id, "location": location, "price": price})
 
             elif action == "HEARTBEAT":
                 LAST_HEARTBEAT[cp_id] = loop.time()
@@ -527,7 +527,8 @@ async def consume_kafka():
                 ACTIVE_SESSIONS[req_cp] = {
                     "driver_id": req_driver,
                     "request_id": req_id,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "notified_started": False
                 }
                 log_event(req_cp, req_driver, "AUTH", {"request_id": req_id})
 
@@ -540,8 +541,7 @@ async def consume_kafka():
                     "session_id": session_id
                 }
                 RECENT_SESSIONS.appendleft(started_item)                     # buffer en memoria
-                await notify_panel({"type": "session.started", **started_item})
-                log_central_msg("SESSION_STARTED", {                         # para últimos 5 mensajes
+                log_central_msg("SUMINISTRO_SOLICITADO", {                         # para últimos 5 mensajes
                     "cp_id": req_cp, "driver_id": req_driver, "session_id": session_id
                 })
                 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -554,13 +554,24 @@ async def consume_kafka():
                     "driver_id": req_driver, "request_id": req_id,
                     "status": "AUTHORIZED", "message": f"Autorizado en {req_cp}"
                 }).encode())
-                print(f"[central.authorize] -> {req_cp}  | [driver.update] AUTHORIZED")
+                
+
 
             elif topic == "cp.telemetry":
                 sess = ACTIVE_SESSIONS.get(cp_id)
                 if not sess:
-                    # Telemetría sin sesión creada por CENTRAL (ignora o registra si quieres)
                     continue
+
+                # Notificamos el inicio de sesion una unica vez
+                if not sess.get("notified_started"):
+                    started_item = {
+                        "ts": now_iso(),
+                        "cp_id": cp_id,
+                        "driver_id": sess["driver_id"],
+                        "session_id": sess["session_id"],
+                    }
+                    await notify_panel({"type": "session.started", **started_item})
+                    sess["notified_started"] = True
 
                 kwh_total = data.get("kwh_total", 0.0)
                 eur_total = data.get("eur_total", 0.0)
@@ -598,7 +609,6 @@ async def consume_kafka():
                     "eur_total": eur_total,
                     "status": "SUMINISTRANDO"
                 })
-                log_central_msg("TELEMETRY", {"cp_id": cp_id, "kwh_total": kwh_total, "eur_total": eur_total})
 
 
             elif topic == "cp.session_ended":
@@ -614,27 +624,70 @@ async def consume_kafka():
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
 
                 if sess:
+                    # Datos finales de la sesión
+                    kwh_final = data.get("kwh")
+                    amount_final = data.get("amount_eur")
+
+                    # Saca location y precio del CP desde BD
+                    cp_row = get_cp_from_db(cp_id) or {}
+                    location = cp_row.get("location")
+                    unit_price = cp_row.get("price_eur_kwh")
+
+                    # Si no viene amount_eur, intenta calcularlo con el precio
+                    if amount_final is None and kwh_final is not None and unit_price is not None:
+                        try:
+                            amount_final = round(float(kwh_final) * float(unit_price), 2)
+                        except Exception:
+                            pass
+
+                    # Cierra sesión en BD
                     end_session(
                         sess["session_id"],
-                        data.get("kwh"),
-                        data.get("amount_eur"),
+                        kwh_final,
+                        amount_final,
                         "ENDED" if reason == "ENDED" else "ABORTED"
                     )
+
                     log_event(cp_id, sess["driver_id"], "END", {
-                        "kwh": data.get("kwh"),
-                        "amount_eur": data.get("amount_eur"),
+                        "kwh": kwh_final,
+                        "amount_eur": amount_final,
                         "reason": reason
                     })
+
+                    # ENVÍA TICKET AL DRIVER (añadimos location y precio por kWh)
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
                         "driver_id": sess["driver_id"],
                         "request_id": sess["request_id"],
                         "status": "FINISHED",
                         "message": f"Servicio finalizado en {cp_id}",
-                        "summary": {"kwh": data.get("kwh"),
-                                    "amount_eur": data.get("amount_eur"),
-                                    "reason": reason}
+                        "summary": {
+                            "cp_id": cp_id,
+                            "location": location,
+                            "price_eur_kwh": unit_price,
+                            "kwh": kwh_final,
+                            "amount_eur": amount_final,
+                            "reason": reason
+                        }
                     }).encode())
-                    log_central_msg("SESSION_ENDED", {"cp_id": cp_id, "reason": reason})
+
+                    log_central_msg("SUMINISTRO_FINALIZADO", {
+                        "cp_id": cp_id, "reason": reason,
+                        "driver_id": sess["driver_id"], 
+                        "kwh": kwh_final, "amount_eur": amount_final})
+                    
+                    # borra del panel de sesiones iniciadas
+                    await notify_panel({
+                        "type": "session.ended",
+                        "ts": now_iso(),
+                        "cp_id": cp_id,
+                        "driver_id": sess["driver_id"],
+                        "session_id": sess["session_id"],
+                        "kwh": kwh_final,
+                        "amount_eur": amount_final,
+                        "reason": reason
+                    })
+
+
                     
 
 
