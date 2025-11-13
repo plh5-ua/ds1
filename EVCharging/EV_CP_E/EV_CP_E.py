@@ -1,5 +1,5 @@
 # EV_CP_E.py — Engine con menú 1–4 (Windows/Linux)
-import asyncio, json, sys, random, threading
+import asyncio, json, sys, random, threading, uuid
 from collections import deque
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
@@ -69,14 +69,14 @@ async def ask(prompt: str) -> str:
 async def register_cp(producer: AIOKafkaProducer):
     msg = {"cp_id": CP_ID, "location": CP_LOCATION, "kwh": PRICE, "status": STATUS}
     await producer.send_and_wait("cp.register", json.dumps(msg).encode())
-    print(f"📡 Registrando CP {CP_ID} en CENTRAL ({CP_LOCATION}) - {PRICE} €/kWh")
+    print(f"Registrando CP {CP_ID} en CENTRAL ({CP_LOCATION}) - {PRICE} €/kWh")
 
 async def send_status(producer: AIOKafkaProducer, status: str):
     global STATUS
     STATUS = status
     payload = {"cp_id": CP_ID, "status": status}
     await producer.send_and_wait("cp.status", json.dumps(payload).encode())
-    print(f"📡 Estado actualizado: {status}")
+    print(f"Estado actualizado: {status}")
 
 # -------------------------------------------------------------
 # CARGA (con confirmación de fin)
@@ -88,7 +88,7 @@ async def start_charging(producer: AIOKafkaProducer):
 
     STATUS = "SUMINISTRANDO"
     await send_status(producer, STATUS)
-    print(f"⚡ Iniciando carga en {CP_ID} (Precio: {PRICE} €/kWh)")
+    print(f"Iniciando carga en {CP_ID} (Precio: {PRICE} €/kWh)")
 
     kwh = 0.0
     for _ in range(50):
@@ -107,7 +107,7 @@ async def start_charging(producer: AIOKafkaProducer):
             "eur_total": amount
         }
         await producer.send_and_wait("cp.telemetry", json.dumps(telem).encode())
-        print(f"🔋 {CP_ID}: {kw} kW — {amount:.3f} €")
+        print(f"{CP_ID}: {kw} kW — {amount:.3f} €")
 
         try:
             await asyncio.wait_for(STOP.wait(), timeout=1.0)
@@ -132,7 +132,7 @@ async def start_charging(producer: AIOKafkaProducer):
     await producer.send_and_wait("cp.session_ended", json.dumps(end_msg).encode())
 
     await send_status(producer, "PARADO" if STOP.is_set() else "ACTIVADO")
-    print("✅ Carga finalizada.")
+    print("Carga finalizada.")
     print_menu()
     CHARGE_TASK = None
 
@@ -143,8 +143,9 @@ def print_menu():
     print("\n===== MENÚ ENGINE =====")
     print("1) Activarse (health=OK / status=ACTIVADO)")
     print("2) Desactivar (KO)  (health=KO / status=PARADO)")
-    print("3) Suministrar a un driver (mostrar disponibles)")
+    print("3) Suministrar a un driver manualmente")
     print("4) Aceptar suministro (si hay autorización pendiente)")
+    print("5) Rechazar suministro (si hay autorización pendiente)")
     print("=======================\n")
 
 async def menu_loop(producer: AIOKafkaProducer):
@@ -155,30 +156,55 @@ async def menu_loop(producer: AIOKafkaProducer):
         if cmd == "1":
             HEALTH = "OK"
             await send_status(producer, "ACTIVADO")
-            print("✅ CP ACTIVADO (salud=OK).")
+            print("CP ACTIVADO (salud=OK).")
         elif cmd == "2":
             HEALTH = "KO"
             await send_status(producer, "PARADO")
-            print("⛔ CP en KO (status PARADO).")
+            print("CP en KO (status PARADO).")
         elif cmd == "3":
-            visibles = [d for d in list(AVAILABLE_DRIVERS) if d.get("cp_id") == CP_ID]
-            if not visibles:
-                print("ℹ️ No hay drivers disponibles para este CP ahora mismo.")
+            if not CP_ID:
+                print("Aún no está registrado el CP (falta registro del monitor).")
+            elif STATUS not in ("ACTIVADO",):
+                print(f"CP no disponible (status={STATUS}).")
+            elif CHARGE_TASK and not CHARGE_TASK.done():
+                print("Ya hay una carga en marcha.")
             else:
-                print("👥 Drivers disponibles (últimos):")
-                for d in visibles:
-                    print(f"   - driver_id={d['driver_id']}  req={d['request_id']}")
+                drv = (await ask("Driver ID para suministro manual: ")).strip()
+                if not drv:
+                    print("Driver ID vacío.")
+                else:
+                    req_id = "manual-" + uuid.uuid4().hex[:8]
+                    payload = {"cp_id": CP_ID, "driver_id": drv, "request_id": req_id}
+                    await producer.send_and_wait("engine.start_manual", json.dumps(payload).encode())
+                    print(f"Enviado engine.start_manual: cp={CP_ID} driver={drv} req={req_id}")
+                    print("↪ Espera 'central.authorize' y luego usa 4) Aceptar suministro para iniciar o 5) Rechazar suministro.")
+
         elif cmd == "4":
             if not PENDING_AUTH or PENDING_AUTH.get("cp_id") != CP_ID:
-                print("⚠️ No hay autorización pendiente para este CP.")
+                print("No hay autorización pendiente para este CP.")
             elif STATUS == "SUMINISTRANDO" or (CHARGE_TASK and not CHARGE_TASK.done()):
-                print("ℹ️ Ya hay una carga en marcha.")
+                print("ℹYa hay una carga en marcha.")
             else:
-                print(f"✅ Aceptando suministro para driver {PENDING_AUTH['driver_id']} ...")
+                print(f"Aceptando suministro para driver {PENDING_AUTH['driver_id']} ...")
                 CHARGE_TASK = asyncio.create_task(start_charging(producer))
                 PENDING_AUTH = None
+        elif cmd == "5":
+            if not PENDING_AUTH or PENDING_AUTH.get("cp_id") != CP_ID:
+                print("No hay autorización pendiente para este CP.")
+            else:
+                reason = "RECHAZADO_POR_ENGINE"
+                payload = {
+                    "cp_id": PENDING_AUTH["cp_id"],
+                    "driver_id": PENDING_AUTH["driver_id"],
+                    "request_id": PENDING_AUTH["request_id"],
+                    "reason": reason,
+                }
+                await producer.send_and_wait("engine.reject", json.dumps(payload).encode())
+                print(f"Rechazo enviado a CENTRAL para driver {PENDING_AUTH['driver_id']}.")
+                PENDING_AUTH = None
+
         else:
-            print("❓ Opción no válida.")
+            print("Opción no válida.")
         print_menu()
 
 # -------------------------------------------------------------
@@ -206,7 +232,7 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
         if "cp_id" in payload and "location" in payload:
             CP_ID = payload["cp_id"]
             CP_LOCATION = payload["location"]
-            print(f"✅ Recibido ID {CP_ID} y ubicación {CP_LOCATION}")
+            print(f"Recibido ID {CP_ID} y ubicación {CP_LOCATION}")
             writer.write(b"ACK"); await writer.drain()
             await send_status(producer, "ACTIVADO")
             return
@@ -214,7 +240,7 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
         # Acciones locales
         if "action" in payload:
             action = (payload["action"] or "").upper()
-            print(f"⚙️ Orden local del monitor: {action}")
+            print(f"Orden local del monitor: {action}")
             if action == "PARAR":
                 await send_status(producer, "PARADO")
                 writer.write(b"OK"); await writer.drain(); return
@@ -235,7 +261,7 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
 
         writer.write(b"NACK"); await writer.drain()
     except Exception as e:
-        print(f"⚠️ Error procesando mensaje del monitor: {e}")
+        print(f"Error procesando mensaje del monitor: {e}")
     finally:
         try:
             writer.close()
@@ -259,7 +285,7 @@ async def start_socket_server(producer: AIOKafkaProducer):
 # -------------------------------------------------------------
 async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProducer):
     global CHARGE_TASK, PENDING_AUTH
-    print("👂 Esperando mensajes de CENTRAL...")
+    print("Esperando mensajes de CENTRAL...")
     try:
         async for msg in consumer:
             data = msg.value
@@ -284,7 +310,7 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
                     "request_id": data.get("request_id"),
                     "cp_id": data.get("cp_id"),
                 }
-                print("🟢 Autorización recibida para este CP. Usa opción 4 para aceptar y comenzar.")
+                print("Autorización recibida para este CP. Usa opción 4 para aceptar y comenzar o 5 para rechazar el suministro.")
                 continue
 
             # STOP / RESUME
@@ -298,11 +324,11 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
                     if CHARGE_TASK and not CHARGE_TASK.done():
                         pass
                     await send_status(producer, "PARADO")
-                    print(f"🛑 Carga detenida por CENTRAL en {CP_ID}")
+                    print(f"Carga detenida por CENTRAL en {CP_ID}")
                 elif action == "RESUME":
                     STOP.clear()
                     await send_status(producer, "ACTIVADO")
-                    print(f"▶️ CP {CP_ID} reanudado por CENTRAL")
+                    print(f"CP {CP_ID} reanudado por CENTRAL")
 
     except asyncio.CancelledError:
         pass
@@ -313,7 +339,6 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
 async def main():
     producer = AIOKafkaProducer(bootstrap_servers=BROKER)
     consumer = AIOKafkaConsumer(
-        # Nota: añadimos 'driver.request' para poder mostrar drivers disponibles
         "driver.request", "central.authorize", "central.command",
         bootstrap_servers=BROKER,
         value_deserializer=lambda b: json.loads(b.decode()),
@@ -323,8 +348,8 @@ async def main():
 
     await producer.start()
     await consumer.start()
-    print(f"🔌 EV_CP_E conectado a Kafka {BROKER}")
-    print(f"🧩 Puerto del Engine para monitor: {ENGINE_PORT}")
+    print(f"EV_CP_E conectado a Kafka {BROKER}")
+    print(f"Puerto del Engine para monitor: {ENGINE_PORT}")
 
     # Lanzar lector de teclado y tareas concurrentes
     loop = asyncio.get_running_loop()
@@ -337,7 +362,7 @@ async def main():
     try:
         await asyncio.gather(socket_task, central_task, menu_task)
     except KeyboardInterrupt:
-        print("\n🛑 Interrumpido por teclado. Cerrando…")
+        print("\nInterrumpido por teclado. Cerrando…")
     finally:
         STOP.set()
         for t in (socket_task, central_task, menu_task):
@@ -356,4 +381,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print(f"\n🔴 Engine en puerto {ENGINE_PORT} detenido por el usuario.")
+        print(f"\nEngine en puerto {ENGINE_PORT} detenido por el usuario.")

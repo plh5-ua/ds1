@@ -9,7 +9,7 @@ USO = "Uso: python EV_Driver.py <broker_ip:puerto> <id_cliente> [fichero_cp_ids]
 def leer_fichero_cps(path: str):
     """Lee un fichero de texto con CPs (uno por línea). Devuelve lista de IDs."""
     if not os.path.exists(path):
-        print(f"❌ Fichero no encontrado: {path}")
+        print(f"Fichero no encontrado: {path}")
         return []
     ids = []
     with open(path, "r", encoding="utf-8") as f:
@@ -19,9 +19,9 @@ def leer_fichero_cps(path: str):
                 continue
             ids.append(t)
     if not ids:
-        print("⚠️ El fichero no contenía CPs válidos.")
+        print("El fichero no contenía CPs válidos.")
     else:
-        print(f"📄 Cargados {len(ids)} CP(s) de {path}")
+        print(f"Cargados {len(ids)} CP(s) de {path}")
     return ids
 
 async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, timeout_sesion=180):
@@ -40,7 +40,7 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
             "request_id": req_id
         }).encode()
     )
-    print(f"📨 Solicitud enviada → CP={cp} | request_id={req_id}")
+    print(f"Solicitud enviada → CP={cp} | request_id={req_id}")
 
     # 2) Espera de esta sesión (updates + telemetrías)
     loop = asyncio.get_running_loop()
@@ -63,7 +63,7 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
         if msg.topic == "driver.update":
             status = (data.get("status") or "").upper()
             message = data.get("message", "")
-            print(f"🔔 Update: {status} — {message}")
+            print(f"Update: {status} — {message}")
 
             if status in {"DENIED", "ERROR"}:
                 # Rechazado o error → concluimos esta solicitud
@@ -118,7 +118,7 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
                 print(f"⚡ {cp} → {kw} kW | {kwh_total} kWh | {eur_total} €")
 
     else:
-        print("⏱️  Timeout esperando conclusión; continúo con el siguiente tras 4 s…")
+        print("Timeout esperando conclusión; continúo con el siguiente tras 4 s…")
 
     # 3) Pausa entre sesiones (requisito)
     await asyncio.sleep(pausa_entre)
@@ -128,11 +128,11 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
 
 async def run_modo_fichero_una_pasada(producer, consumer, driver_id, cp_ids):
     """Recorre la lista de CPs una sola vez (sin bucle infinito)."""
-    print(f"🗂️  Modo fichero: {len(cp_ids)} CP(s) → una pasada.")
+    print(f"Modo fichero: {len(cp_ids)} CP(s) → una pasada.")
     for cp in cp_ids:
         ok = await solicitar_una_carga(producer, consumer, driver_id, cp)
         if not ok:
-            print("⚠️ Se interrumpió la sesión por error; continúo con el siguiente CP…")
+            print("Se interrumpió la sesión por error; continúo con el siguiente CP…")
             await asyncio.sleep(2)
 
 async def run_modo_interactivo(producer, consumer, driver_id):
@@ -142,7 +142,7 @@ async def run_modo_interactivo(producer, consumer, driver_id):
       - ':load RUTA' para cargar un fichero y lanzar UNA PASADA.
       - 'q' o vacío para salir.
     """
-    print("💬 Modo interactivo. Escribe un CP y pulsa Enter.")
+    print("Modo interactivo. Escribe un CP y pulsa Enter.")
     print("   Comandos: ':load RUTA' (una pasada desde fichero) | 'q' para salir.")
     while True:
         line = input("CP a solicitar (o ':load RUTA'): ").strip()
@@ -157,7 +157,7 @@ async def run_modo_interactivo(producer, consumer, driver_id):
                 try:
                     await run_modo_fichero_una_pasada(producer, consumer, driver_id, ids)
                 except KeyboardInterrupt:
-                    print("\n🛑 Pasada interrumpida. Vuelves al modo interactivo.")
+                    print("\nPasada interrumpida. Vuelves al modo interactivo.")
             continue
 
         # Una solicitud directa
@@ -178,7 +178,7 @@ async def run(broker, driver_id, cp_ids=None):
 
     await producer.start()
     await consumer.start()
-    print(f"🚗 EV_Driver listo → broker={broker} | driver={driver_id}")
+    print(f"EV_Driver listo → broker={broker} | driver={driver_id}")
 
     try:
         if cp_ids:
@@ -187,7 +187,7 @@ async def run(broker, driver_id, cp_ids=None):
             print("✔️ Pasada de fichero completada.")
 
         # 2) Siempre entramos en interactivo después
-        print("🎛️ Entrando en modo interactivo (Ctrl+C o 'q' para salir).")
+        print("Entrando en modo interactivo (Ctrl+C o 'q' para salir).")
         await run_modo_interactivo(producer, consumer, driver_id)
 
     finally:

@@ -55,8 +55,8 @@
     <tbody></tbody>
   </table>
 
-  <!-- Sesiones iniciadas -->
-  <h2>Sesiones iniciadas</h2>
+  <!-- Suministros en directo -->
+  <h2>Suministros activos</h2>
   <table id="sessionsTable">
     <thead>
       <tr>
@@ -69,7 +69,7 @@
     <tbody></tbody>
   </table>
 
-  <!-- Últimos 5 mensajes -->
+
   <h2>Últimos 5 mensajes</h2>
   <table id="messagesTable">
     <thead>
@@ -139,7 +139,7 @@ const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
       return;
     }
 
-    // ⬇️ SOLO tocar las celdas si el campo viene en raw
+    // SOLO tocar las celdas si el campo viene en raw
     if (has(raw, "location")) {
       row.children[1].textContent = raw.location ?? row.children[1].textContent;
     }
@@ -285,8 +285,8 @@ function prependMessageRow(m) {
           return;
         }
       };
-      ws.onopen = () => console.log("✅ Conectado al panel WebSocket");
-      ws.onclose = () => console.log("❌ Desconectado del panel WebSocket");
+      ws.onopen = () => console.log("Conectado al panel WebSocket");
+      ws.onclose = () => console.log("Desconectado del panel WebSocket");
     }
 
     // Arranque
