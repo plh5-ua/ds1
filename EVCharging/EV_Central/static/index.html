@@ -11,18 +11,11 @@
     th { background: #eee; }
     .estado { font-weight: bold; color: white; border-radius: 4px; padding: 5px 10px; }
     .ACTIVADO { background: #28a745; }
-    .SUMINISTRANDO { background: #28a745; }  /* verde */
+    .SUMINISTRANDO { background: #28a745; }
     .PARADO { background: orange; }
     .DESCONECTADO { background: gray; }
     .AVERIA { background: red; }
-    button {
-      margin: 2px;
-      padding: 5px 8px;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-      font-weight: bold;
-    }
+    button { margin: 2px; padding: 5px 8px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
     button.stop { background: orange; color: white; }
     button.resume { background: #28a745; color: white; }
     button.global { margin: 5px; padding: 8px 12px; }
@@ -31,7 +24,6 @@
 <body>
   <h1>⚡ EV Central - Panel de Monitorización ⚡</h1>
 
-  <!-- Botones globales (si /command está implementado en la API) -->
   <div style="margin-bottom: 15px;">
     <button class="global stop" onclick="sendCommand('STOP', 'ALL')">🛑 STOP ALL</button>
     <button class="global resume" onclick="sendCommand('RESUME', 'ALL')">▶️ RESUME ALL</button>
@@ -55,7 +47,7 @@
     <tbody></tbody>
   </table>
 
-  <!-- Suministros en directo -->
+  <!-- Suministros activos (solo RUNNING desde BD) -->
   <h2>Suministros activos</h2>
   <table id="sessionsTable">
     <thead>
@@ -69,7 +61,6 @@
     <tbody></tbody>
   </table>
 
-
   <h2>Últimos 5 mensajes</h2>
   <table id="messagesTable">
     <thead>
@@ -82,7 +73,6 @@
     <tbody></tbody>
   </table>
 
-  <!-- Estado central -->
   <div id="centralState" style="margin-top: 12px; font-weight: bold;">
     Estado de CENTRAL: <span id="centralStateValue">—</span>
   </div>
@@ -94,7 +84,7 @@
     const messagesBody = document.querySelector("#messagesTable tbody");
     const centralStateValue = document.getElementById("centralStateValue");
 
-    // --- Helpers ---
+    // --- Helpers CPs ---
     function normalize(cp) {
       return {
         id: cp.id || cp.cp_id,
@@ -109,123 +99,129 @@
     function fmt(n, digits = 3) {
       return (n === null || n === undefined) ? "—" : Number(n).toFixed(digits);
     }
+    const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
 
-const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
+    function updateRow(raw) {
+      const cp = normalize(raw);
+      let row = document.getElementById(cp.id);
+      const now = new Date().toLocaleTimeString();
 
-  function updateRow(raw) {
-    const cp = normalize(raw);
-    let row = document.getElementById(cp.id);
-    const now = new Date().toLocaleTimeString();
+      if (!row) {
+        row = document.createElement("tr");
+        row.id = cp.id;
+        row.innerHTML = `
+          <td>${cp.id}</td>
+          <td>${cp.location}</td>
+          <td>${cp.price_eur_kwh.toFixed(2)}</td>
+          <td class="estado ${cp.status}">${cp.status}</td>
+          <td>${fmt(cp.kwh_total, 3)}</td>
+          <td>${fmt(cp.eur_total, 2)}</td>
+          <td>${cp.driver_id ?? "—"}</td>
+          <td>${now}</td>
+          <td>
+            <button class="stop" onclick="sendCommand('STOP', '${cp.id}')">STOP</button>
+            <button class="resume" onclick="sendCommand('RESUME', '${cp.id}')">RESUME</button>
+          </td>
+        `;
+        tableBody.appendChild(row);
+        return;
+      }
 
-    if (!row) {
-      // crear fila como ya lo haces
-      row = document.createElement("tr");
-      row.id = cp.id;
-      row.innerHTML = `
-        <td>${cp.id}</td>
-        <td>${cp.location}</td>
-        <td>${cp.price_eur_kwh.toFixed(2)}</td>
-        <td class="estado ${cp.status}">${cp.status}</td>
-        <td>${fmt(cp.kwh_total, 3)}</td>
-        <td>${fmt(cp.eur_total, 2)}</td>
-        <td>${cp.driver_id ?? "—"}</td>
-        <td>${now}</td>
-        <td>
-          <button class="stop" onclick="sendCommand('STOP', '${cp.id}')">STOP</button>
-          <button class="resume" onclick="sendCommand('RESUME', '${cp.id}')">RESUME</button>
-        </td>
-      `;
-      tableBody.appendChild(row);
-      return;
-    }
+      if (has(raw, "location")) row.children[1].textContent = raw.location ?? row.children[1].textContent;
+      if (has(raw, "price_eur_kwh")) row.children[2].textContent = Number(raw.price_eur_kwh).toFixed(2);
 
-    // SOLO tocar las celdas si el campo viene en raw
-    if (has(raw, "location")) {
-      row.children[1].textContent = raw.location ?? row.children[1].textContent;
-    }
-    if (has(raw, "price_eur_kwh")) {
-      row.children[2].textContent = Number(raw.price_eur_kwh).toFixed(2);
-    }
-    if (has(raw, "status")) {
-      row.children[3].textContent = cp.status;
-      row.children[3].className = "estado " + cp.status;
+      if (has(raw, "status")) {
+        row.children[3].textContent = cp.status;
+        row.children[3].className = "estado " + cp.status;
+        if (raw.status !== "SUMINISTRANDO") {
+          row.children[4].textContent = "—";
+          row.children[5].textContent = "—";
+          row.children[6].textContent = "—";
+        }
+      }
+      if (has(raw, "kwh_total")) row.children[4].textContent = fmt(raw.kwh_total, 3);
+      if (has(raw, "eur_total")) row.children[5].textContent = fmt(raw.eur_total, 2);
+      if (has(raw, "driver_id")) row.children[6].textContent = raw.driver_id ?? "—";
 
-      // solo limpiar totales/driver si llegó un status y NO es SUMINISTRANDO
-      if (raw.status !== "SUMINISTRANDO") {
-        row.children[4].textContent = "—";
-        row.children[5].textContent = "—";
-        row.children[6].textContent = "—";
+      if (["location","price_eur_kwh","status","kwh_total","eur_total","driver_id"].some(k => has(raw, k))) {
+        row.children[7].textContent = now;
       }
     }
-    if (has(raw, "kwh_total")) {
-      row.children[4].textContent = fmt(raw.kwh_total, 3);
-    }
-    if (has(raw, "eur_total")) {
-      row.children[5].textContent = fmt(raw.eur_total, 2);
-    }
-    if (has(raw, "driver_id")) {
-      row.children[6].textContent = raw.driver_id ?? "—";
-    }
 
-    // Actualiza “Última actualización” solo si llegó algún campo relevante
-    if (["location","price_eur_kwh","status","kwh_total","eur_total","driver_id"]
-          .some(k => has(raw, k))) {
-      row.children[7].textContent = now;
-    }
-  }
+    // --- Helpers sesiones RUNNING (BD) ---
+    function rowIdForSession(id) { return `sess-${id}`; }
 
-    // --- Tablas inferiores ---
-    function prependSessionRow(s) {
+    function addRunningSession(s) {
+      const rid = rowIdForSession(s.session_id);
+      if (document.getElementById(rid)) return;
       const tr = document.createElement("tr");
-      tr.id = `sess-${s.session_id}`;
+      tr.id = rid;
       tr.innerHTML = `
-        <td>${s.ts}</td>
-        <td>${s.driver_id}</td>
-        <td>${s.cp_id}</td>
+        <td>${s.ts ?? ""}</td>
+        <td>${s.driver_id ?? ""}</td>
+        <td>${s.cp_id ?? ""}</td>
         <td>${s.session_id}</td>
       `;
       sessionsBody.prepend(tr);
-      while (sessionsBody.children.length > 50) sessionsBody.removeChild(sessionsBody.lastChild);
+      while (sessionsBody.children.length > 200) sessionsBody.removeChild(sessionsBody.lastChild);
     }
-function prependMessageRow(m) {
-  // Normaliza: acepta tanto {type, detail} como {msg_type, detail}
-  const ts = m.ts || new Date().toLocaleString();
-  const msgType = m.msg_type || m.type || "MSG";
-  const detail = JSON.stringify(m.detail ?? m);
-  const tr = document.createElement("tr");
-  tr.innerHTML = `
-    <td>${ts}</td>
-    <td>${msgType}</td>
-    <td style="font-family: monospace;">${detail}</td>
-  `;
-  messagesBody.prepend(tr);
-  while (messagesBody.children.length > 5) messagesBody.removeChild(messagesBody.lastChild);
-}
 
+    function removeSessionRow(session_id) {
+      const el = document.getElementById(rowIdForSession(session_id));
+      if (el) el.remove();
+    }
 
+    function renderRunningSessions(list) {
+      sessionsBody.innerHTML = "";
+      (list || []).filter(s => s.status === "RUNNING").forEach(addRunningSession);
+    }
 
-    // --- Carga inicial desde API ---
+    // --- Carga inicial ---
     async function loadCPs() {
       const res = await fetch("/cp");
       const data = await res.json();
       data.forEach(updateRow);
     }
+
+    async function loadActiveSessions() {
+      try {
+        const res = await fetch("/sessions/active"); // ← BD: solo RUNNING
+        const data = await res.json();
+        renderRunningSessions(data);
+      } catch (e) {
+        console.warn("No se pudo cargar /sessions/active:", e);
+      }
+    }
+
     async function loadCentralSummary() {
       try {
         const res = await fetch("/central/summary");
         const data = await res.json();
-        // Estado
         centralStateValue.textContent = data.status || "—";
-        // Sesiones (más antiguas primero para que las recientes queden arriba con prepend)
-        (data.sessions || []).reverse().forEach(prependSessionRow);
-        // Mensajes
+        // OJO: ya no usamos data.sessions aquí para la tabla de activos,
+        // se rellena con /sessions/active (BD). Sí usamos los mensajes:
         (data.messages || []).reverse().forEach(prependMessageRow);
       } catch (e) {
         console.warn("No se pudo cargar /central/summary:", e);
       }
     }
 
-    // --- Comandos (si el endpoint /command existe) ---
+    // --- Mensajes buffer ---
+    function prependMessageRow(m) {
+      const ts = m.ts || new Date().toLocaleString();
+      const msgType = m.msg_type || m.type || "MSG";
+      const detail = JSON.stringify(m.detail ?? m);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${ts}</td>
+        <td>${msgType}</td>
+        <td style="font-family: monospace;">${detail}</td>
+      `;
+      messagesBody.prepend(tr);
+      while (messagesBody.children.length > 5) messagesBody.removeChild(messagesBody.lastChild);
+    }
+
+    // --- Comandos ---
     async function sendCommand(action, cpId) {
       try {
         const res = await fetch('/command', {
@@ -240,23 +236,18 @@ function prependMessageRow(m) {
       }
     }
 
-    // --- WebSocket: eventos live ---
+    // --- WebSocket (live) ---
     function connectWebSocket() {
       const ws = new WebSocket(`ws://${window.location.host}/ws`);
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        // Últimos 5 mensajes (buffer)
-        if (msg.type === "central.msg") {
-          prependMessageRow(msg);
-          return;
-        }
-        // Actualizaciones de estado (status) → tabla principal
-        if ((msg.id || msg.cp_id) && msg.status) {
-          updateRow(msg);
-          return;
-        }
 
-        // Telemetría → fuerza SUMINISTRANDO + totales + driver
+        if (msg.type === "central.msg") { prependMessageRow(msg); return; }
+
+        // Actualizaciones CP
+        if ((msg.id || msg.cp_id) && msg.status) { updateRow(msg); return; }
+
+        // Telemetría
         if (msg.type === "telemetry") {
           updateRow({
             cp_id: msg.cp_id,
@@ -268,22 +259,13 @@ function prependMessageRow(m) {
           return;
         }
 
-        // Nueva sesión iniciada (para la tabla inferior)
-        if (msg.type === "session.started") {
-          prependSessionRow(msg);
-          return;
-        }
-        if (msg.type === "session.ended") {
-          const tr = document.getElementById(`sess-${msg.session_id}`);
-          if (tr && tr.parentNode) tr.parentNode.removeChild(tr); // o marca FINISHED si prefieres
-          prependMessageRow({ ts: msg.ts, msg_type: "SESSION_ENDED", detail: msg });
-          return;
-        }
-        // Estado de CENTRAL (OK/STOP)
-        if (msg.type === "central.state") {
-          centralStateValue.textContent = msg.status;
-          return;
-        }
+        // Sesión empieza (la añadimos a la tabla de activos)
+        if (msg.type === "session.started") { addRunningSession(msg); return; }
+
+        // Sesión termina (la quitamos de la tabla de activos)
+        if (msg.type === "session.ended") { removeSessionRow(msg.session_id); return; }
+
+        if (msg.type === "central.state") { centralStateValue.textContent = msg.status; return; }
       };
       ws.onopen = () => console.log("Conectado al panel WebSocket");
       ws.onclose = () => console.log("Desconectado del panel WebSocket");
@@ -291,9 +273,9 @@ function prependMessageRow(m) {
 
     // Arranque
     loadCPs();
-    loadCentralSummary();
+    loadActiveSessions();   // ← inicial desde BD
+    loadCentralSummary();   // ← estado y últimos mensajes
     connectWebSocket();
   </script>
-
 </body>
 </html>

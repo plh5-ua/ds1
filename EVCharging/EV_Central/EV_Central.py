@@ -36,8 +36,8 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 # Monitoreo de heartbeats
 # ---------------------------------------------------------------------------
 LAST_HEARTBEAT = {}
-HEARTBEAT_TIMEOUT = 3  # segundos sin recibir heartbeat → DESCONECTADO
-
+HEARTBEAT_TIMEOUT = 2.5  # segundos sin recibir heartbeat → DESCONECTADO
+LAST_STATUS_SEEN = {}
 # Última telemetría por CP para exponerla en /cp y en el panel
 LAST_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 
@@ -293,6 +293,20 @@ async def send_command(cmd: Command):
     await kafka_producer.send_and_wait("central.command", json.dumps(payload).encode())
     return {"status": "ok", "sent": payload}
 
+def list_active_sessions():
+    with closing(get_db()) as con:
+        rows = con.execute("""
+            SELECT id as session_id, cp_id, driver_id, datetime(started_at) as ts, status
+            FROM sessions
+            WHERE status='RUNNING'
+            ORDER BY started_at DESC
+            LIMIT 200
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+@app.get("/sessions/active")
+def api_sessions_active():
+    return list_active_sessions()
 
 
 # ---------------------------------------------------------------------------
@@ -358,38 +372,68 @@ def monitor_socket_server(loop):
                 health = (msg.get("health") or "KO").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
 
-                # Si entra en KO mientras suministra → STOP
+                # Estado previo (preferimos el último visto por heartbeat; si no, BD)
                 try:
-                    cur = get_cp_from_db(cp_id)
-                    cur_status = (cur.get("status") if cur else "DESCONECTADO").upper()
+                    db_row = get_cp_from_db(cp_id) or {}
+                    db_status = (db_row.get("status") or "DESCONECTADO").upper()
                 except Exception:
-                    cur_status = "DESCONECTADO"
+                    db_status = "DESCONECTADO"
 
-                if health == "KO" and cur_status == "SUMINISTRANDO":
+                prev_status = LAST_STATUS_SEEN.get(cp_id, db_status)
+
+                # Si entra en KO mientras suministra → STOP inmediato
+                if health == "KO" and db_status == "SUMINISTRANDO":
                     asyncio.run_coroutine_threadsafe(
                         kafka_producer.send_and_wait(
-                            "central.command", json.dumps({"action": "STOP", "cp_id": cp_id}).encode()
+                            "central.command",
+                            json.dumps({"action": "STOP", "cp_id": cp_id}).encode()
                         ),
                         loop
                     )
+                    asyncio.run_coroutine_threadsafe(
+                        force_close_session(cp_id, "FAULT"),
+                        loop
+                    )
 
-                # No machacar PARADO/DESCONECTADO con ACTIVADO por heartbeat
-                if new_status == "ACTIVADO" and cur_status in {"PARADO", "DESCONECTADO"}:
-                    try: conn.sendall(health.encode())
-                    except Exception: pass
+                # No machacar PARADO/DESCONECTADO con ACTIVADO solo por heartbeat
+                if new_status == "ACTIVADO" and db_status in {"PARADO", "DESCONECTADO"}:
+                    try:
+                        conn.sendall(health.encode())
+                    except Exception:
+                        pass
+                    # Actualiza "visto" para no spamear logs si sigue viniendo OK
+                    LAST_STATUS_SEEN[cp_id] = prev_status
                     return
 
-                # Evitar pasar a ACTIVADO si ya suministra
+                # Evitar pasar a ACTIVADO si ya está suministrando
                 if not (new_status == "ACTIVADO" and is_suministrando_cp(cp_id)):
+                    # --- LOG de transición (una sola vez por cambio) ---
+                    if prev_status != new_status:
+                        if prev_status == "AVERIA" and new_status == "ACTIVADO":
+                            log_central_msg("AVERIA SOLUCIONADA", {"cp_id": cp_id, "from": prev_status, "to": new_status})
+                        elif prev_status == "ACTIVADO" and new_status == "AVERIA":
+                            log_central_msg("AVERIA", {"cp_id": cp_id, "from": prev_status, "to": new_status})
+
+                    # Persistir y notificar
                     update_cp(cp_id, new_status)
                     cp_data = get_cp_from_db(cp_id) or {"id": cp_id, "status": new_status}
                     cp_data["status"] = new_status
                     asyncio.run_coroutine_threadsafe(
-                        notify_panel({"type": "heartbeat", **cp_data}), loop
+                        notify_panel({"type": "heartbeat", **cp_data}), loop,
                     )
 
-                try: conn.sendall(health.encode())
-                except Exception: pass
+                    # Actualiza el último estado visto
+                    LAST_STATUS_SEEN[cp_id] = new_status
+                else:
+                    # Si seguimos suministrando, no cambiamos a ACTIVADO, pero devolvemos OK
+                    LAST_STATUS_SEEN[cp_id] = db_status
+
+                try:
+                    conn.sendall(health.encode())
+                except Exception:
+                    pass
+
+
 
             else:
                 try: conn.sendall(b"NACK")
@@ -413,6 +457,11 @@ async def monitor_disconnections():
         for cp_id, last in list(LAST_HEARTBEAT.items()):
             if now - last > HEARTBEAT_TIMEOUT:
                 print(f"CP {cp_id} no ha mandado heartbeat en {HEARTBEAT_TIMEOUT}s → DESCONECTADO")
+
+                # Si estaba suministrando, cierra sesión antes de actualizar estado
+                if cp_id in ACTIVE_SESSIONS:
+                    await force_close_session(cp_id, "DISCONNECTED")
+
                 update_cp(cp_id, "DESCONECTADO")
                 cp_data = get_cp_from_db(cp_id)
                 if cp_data:
@@ -420,6 +469,7 @@ async def monitor_disconnections():
                     await notify_panel({"type": "heartbeat", **cp_data})
                 log_central_msg("DISCONNECTED", {"cp_id": cp_id, "since_sec": HEARTBEAT_TIMEOUT})
                 del LAST_HEARTBEAT[cp_id]
+
 
         await asyncio.sleep(2)
 
@@ -434,6 +484,60 @@ kafka_producer = None
 # cp_id -> {"driver_id":..., "request_id":..., "session_id":...}
 ACTIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
+async def force_close_session(cp_id: str, reason_code: str):
+    """
+    Cierra en CENTRAL la sesión activa del cp_id (si existe), usando la última
+    telemetría conocida. Envía ticket al driver, actualiza panel y deja todo limpio.
+    """
+    sess = ACTIVE_SESSIONS.pop(cp_id, None)
+    if not sess:
+        return
+
+    # Última lectura conocida (si no hubo, 0.0)
+    lt = LAST_TELEMETRY.pop(cp_id, {}) or {}
+    kwh_final = float(lt.get("kwh_total") or 0.0)
+    eur_final = float(lt.get("eur_total") or 0.0)
+
+    # Info del CP para ticket
+    cp_row = get_cp_from_db(cp_id) or {}
+    location = cp_row.get("location")
+    unit_price = cp_row.get("price_eur_kwh")
+
+    # Cierra en BD con el código indicado
+    end_session(sess["session_id"], kwh_final, eur_final, ended_status=reason_code)
+
+    # Ticket al driver
+    await kafka_producer.send_and_wait("driver.update", json.dumps({
+        "driver_id": sess["driver_id"],
+        "request_id": sess["request_id"],
+        "status": "FINISHED",
+        "message": f"Servicio finalizado en {cp_id}",
+        "summary": {
+            "cp_id": cp_id,
+            "location": location,
+            "price_eur_kwh": unit_price,
+            "kwh": kwh_final,
+            "amount_eur": eur_final,
+            "reason": reason_code
+        }
+    }).encode())
+
+    # Log + panel
+    log_central_msg("SUMINISTRO_FINALIZADO", {
+        "cp_id": cp_id, "reason": reason_code,
+        "driver_id": sess["driver_id"], "kwh": kwh_final, "amount_eur": eur_final
+    })
+
+    await notify_panel({
+        "type": "session.ended",
+        "ts": now_iso(),
+        "cp_id": cp_id,
+        "driver_id": sess["driver_id"],
+        "session_id": sess["session_id"],
+        "kwh": kwh_final,
+        "amount_eur": eur_final,
+        "reason": reason_code
+    })
 
 async def consume_kafka():
     global kafka_consumer
@@ -466,9 +570,17 @@ async def consume_kafka():
             price = data.get("kwh", 0.30)
 
             if topic == "cp.status":
-                status = data.get("status", "ACTIVADO")
+                status = (data.get("status") or "ACTIVADO").upper()
+
+                # Si estaba suministrando y el nuevo estado no permite suministro → cerrar
+                if status in {"AVERIA", "PARADO", "DESCONECTADO"} and cp_id in ACTIVE_SESSIONS:
+                    # Elige un código de cierre coherente
+                    reason_code = "FAULT" if status == "AVERIA" else ("DISCONNECTED" if status == "DESCONECTADO" else "ABORTED")
+                    await force_close_session(cp_id, reason_code)
+
                 update_cp(cp_id, status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": status})
+
 
             elif topic == "driver.request":
                 req_cp = data["cp_id"]; req_driver = data["driver_id"]; req_id = data["request_id"]
@@ -673,7 +785,7 @@ async def consume_kafka():
                     row = db_get_cp(con, acc_cp)
                 if not row:
                     # CP desconocido
-                    log_central_msg("MANUAL_START_DENIED", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": "CP not found"})
+                    log_central_msg("INICIO_MANUAL_DENEGADO", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": "CP not found"})
                     continue
                 if acc_cp in ACTIVE_SESSIONS:
                     # Ocupado: no crear sesión manual
@@ -681,14 +793,14 @@ async def consume_kafka():
                         "driver_id": acc_drv, "request_id": acc_req,
                         "status": "DENIED", "message": f"CP {acc_cp} ocupado"
                     }).encode())
-                    log_central_msg("MANUAL_START_DENIED", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": "busy"})
+                    log_central_msg("INICIO_MANUAL_DENEGADO", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": "busy"})
                     continue
                 if row["status"] not in ("ACTIVADO",):
                     await kafka_producer.send_and_wait("driver.update", json.dumps({
                         "driver_id": acc_drv, "request_id": acc_req,
                         "status": "DENIED", "message": f"CP {acc_cp} no disponible (estado {row['status']})"
                     }).encode())
-                    log_central_msg("MANUAL_START_DENIED", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": f"status={row['status']}"})
+                    log_central_msg("INICIO_MANUAL_DENEGADO", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": f"status={row['status']}"})
                     continue
 
                 # Crear sesión y autorizar 
@@ -720,7 +832,7 @@ async def consume_kafka():
                 sess = ACTIVE_SESSIONS.get(rej_cp)
                 if not sess:
                     # No hay sesión activa: solo loguea
-                    log_central_msg("ENGINE_REJECT_IGNORED", {"cp_id": rej_cp, "driver_id": rej_drv, "reason": "no active session"})
+                    log_central_msg("ENGINE_RECHAZA_SUMINISTRO", {"cp_id": rej_cp, "driver_id": rej_drv, "reason": "no active session"})
                 else:
                     # comprobar coincidencia (si no coincide, también se limpia por seguridad)
                     if (sess.get("driver_id") == rej_drv) and (sess.get("request_id") == rej_req):
@@ -765,7 +877,6 @@ async def consume_kafka():
                             "cp_id": rej_cp, "driver_id": rej_drv, "request_id": rej_req
                         })
                     else:
-                        # Mismatch pero limpia por coherencia
                         ACTIVE_SESSIONS.pop(rej_cp, None)
                         update_cp(rej_cp, "ACTIVADO")
                         log_central_msg("ENGINE_REJECT_MISMATCH", {

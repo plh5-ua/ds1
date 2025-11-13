@@ -24,7 +24,7 @@ def send_to_central(message):
             s.connect((CENTRAL_IP, CENTRAL_PORT))
             s.sendall(json.dumps(message).encode())
     except Exception as e:
-        print(f"⚠️ Error enviando a CENTRAL: {e}")
+        print(f"Error enviando a CENTRAL: {e}")
 
 # -------------------------------------------------------------
 # Comunicación con ENGINE (por socket)
@@ -39,7 +39,7 @@ def send_id_to_engine():
             ack = s.recv(16).decode().strip()
             return ack == "ACK"
     except Exception as e:
-        print(f"❌ Error al enviar ID al Engine: {e}")
+        print(f"Error al enviar ID al Engine: {e}")
         return False
 
 def ping_engine():
@@ -65,7 +65,7 @@ async def heartbeat_loop():
             "cp_id": CP_ID,
             "health": health
         })
-        print(f"❤️‍🔥 Heartbeat {CP_ID} ({health})")
+        print(f"Heartbeat {CP_ID} ({health})")
         await asyncio.sleep(1)
 
 # -------------------------------------------------------------
@@ -82,9 +82,9 @@ async def main():
     })
     # 2️ Enviar ID al Engine
     if send_id_to_engine():
-        print(f"✅ Engine confirmó ACK para {CP_ID}. Iniciando heartbeats...")
+        print(f"Engine confirmó ACK para {CP_ID}. Iniciando heartbeats...")
         await heartbeat_loop()
     else:
-        print("❌ No se recibió ACK del Engine. No se iniciarán heartbeats.")
+        print("No se recibió ACK del Engine. No se iniciarán heartbeats.")
 
 asyncio.run(main())
