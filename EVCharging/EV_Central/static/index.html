@@ -276,6 +276,12 @@
     loadActiveSessions();   // ← inicial desde BD
     loadCentralSummary();   // ← estado y últimos mensajes
     connectWebSocket();
+    
+    setInterval(() => {
+    loadCPs();           
+    loadActiveSessions(); 
+    // loadCentralSummary(); para refrescar ultimos mensajes 
+  }, 3000);
   </script>
 </body>
 </html>

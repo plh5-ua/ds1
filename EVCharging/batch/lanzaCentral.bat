@@ -4,7 +4,7 @@ setlocal
 rem === CONFIGURACIÓN ===
 set "RUTA_CENTRAL=D:\sd1\ds1\ds1\EVCharging\EV_Central"
 set "SCRIPT=EV_Central.py"
-set "HTTP_PORT=8080"
+set "HTTP_PORT=8081"
 set "BROKER=127.0.0.1:9092"
 
 rem === Cambia de directorio ===

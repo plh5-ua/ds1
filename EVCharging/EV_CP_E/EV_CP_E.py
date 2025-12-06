@@ -97,7 +97,7 @@ async def start_charging(producer: AIOKafkaProducer):
     print(f"Iniciando carga en {CP_ID} (Precio: {PRICE} €/kWh)")
 
     kwh = 0.0
-    for _ in range(50):
+    for _ in range(360000):
         if STOP.is_set():
             break
         kw = round(random.uniform(6.0, 7.5), 2)
@@ -156,6 +156,7 @@ def print_menu():
     print("3) Suministrar a un driver manualmente")
     print("4) Aceptar suministro (si hay autorización pendiente)")
     print("5) Rechazar suministro (si hay autorización pendiente)")
+    print("6) Finalizar suministro en curso (si hay)")
     print("=======================\n")
 
 async def menu_loop(producer: AIOKafkaProducer):
@@ -218,7 +219,12 @@ async def menu_loop(producer: AIOKafkaProducer):
                 await producer.send_and_wait("engine.reject", json.dumps(payload).encode())
                 print(f"Rechazo enviado a CENTRAL para driver {PENDING_AUTH['driver_id']}.")
                 PENDING_AUTH = None
-
+        elif cmd == "6":
+            if STATUS != "SUMINISTRANDO" or not (CHARGE_TASK and not CHARGE_TASK.done()):
+                print("No hay ninguna carga en curso.")
+            else:
+                STOP.set()
+                print("Solicitud de finalización de carga enviada.")
         else:
             print("Opción no válida.")
         print_menu()

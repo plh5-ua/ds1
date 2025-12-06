@@ -39,6 +39,53 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL,   -- HEARTBEAT | STATUS | TELEMETRY | COMMAND | AUTH | ERROR
     payload TEXT NOT NULL
 );
+-- Historial de cambios en charging_points
+CREATE TABLE IF NOT EXISTS charging_points_history (
+    id TEXT,  -- igual que charging_points.id
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    old_status TEXT,
+    new_status TEXT,
+    old_price_eur_kwh REAL,
+    new_price_eur_kwh REAL,
+    action TEXT   -- 'UPDATE', 'INSERT', 'DELETE'
+);
+
+CREATE TRIGGER IF NOT EXISTS log_cp_update
+AFTER UPDATE ON charging_points
+FOR EACH ROW
+BEGIN
+    INSERT INTO charging_points_history (
+        id,
+        old_status, new_status,
+        old_price_eur_kwh, new_price_eur_kwh,
+        action
+    )
+    VALUES (
+        OLD.id,
+        OLD.status, NEW.status,
+        OLD.price_eur_kwh, NEW.price_eur_kwh,
+        'UPDATE'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS log_cp_insert
+AFTER INSERT ON charging_points
+FOR EACH ROW
+BEGIN
+    INSERT INTO charging_points_history (
+        id,
+        new_status,
+        new_price_eur_kwh,
+        action
+    )
+    VALUES (
+        NEW.id,
+        NEW.status,
+        NEW.price_eur_kwh,
+        'INSERT'
+    );
+END;
+
 
 -- Índices para mejorar búsquedas
 CREATE INDEX IF NOT EXISTS idx_sessions_cp ON sessions(cp_id);
