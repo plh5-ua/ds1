@@ -404,7 +404,16 @@ def monitor_socket_server(loop):
                     LAST_STATUS_SEEN[cp_id] = prev_status
                     return
 
-                # Evitar pasar a ACTIVADO si ya está suministrando
+                # Evitar pasar a Activaddo si esta parado esste if es probable
+                if new_status == "ACTIVADO" and db_status == "PARADO":
+                    try:
+                        conn.sendall(health.encode())
+                    except Exception:
+                        pass
+                    LAST_STATUS_SEEN[cp_id] = prev_status
+                    return
+                
+                 # Evitar pasar a ACTIVADO si ya está suministrando
                 if not (new_status == "ACTIVADO" and is_suministrando_cp(cp_id)):
                     # --- LOG de transición (una sola vez por cambio) ---
                     if prev_status != new_status:
