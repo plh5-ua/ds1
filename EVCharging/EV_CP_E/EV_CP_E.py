@@ -35,6 +35,9 @@ PROMPT_FUT: asyncio.Future | None = None
 AVAILABLE_DRIVERS = deque(maxlen=50)   # [{'driver_id','request_id','cp_id','ts'}]
 PENDING_AUTH = None                    # {'driver_id','request_id','cp_id'}
 
+END_REASON = None
+STOP_CENTRAL = False
+
 # -------------------------------------------------------------
 # UTILIDADES DE TECLADO 
 # -------------------------------------------------------------
@@ -88,26 +91,27 @@ async def send_status(producer: AIOKafkaProducer, status: str):
 # CARGA (con finalización automática si hay STOP)
 # -------------------------------------------------------------
 async def start_charging(producer: AIOKafkaProducer):
-    """Inicia carga (tras aceptación). Si se activa STOP por KO/PARADO/DESCONECTADO/STOP central,
-    termina sin pedir confirmación y envía cp.session_ended(reason=ABORTED)."""
-    global STATUS, CHARGE_TASK
+    global STATUS, CHARGE_TASK, END_REASON, HEALTH, STOP_CENTRAL
+
     STOP.clear()
+    END_REASON = None          
     STATUS = "SUMINISTRANDO"
     await send_status(producer, STATUS)
     print(f"Iniciando carga en {CP_ID} (Precio: {PRICE} €/kWh)")
 
     kwh = 0.0
-    for _ in range(360000):
+
+    for _ in range(360000):    
         if STOP.is_set():
             break
+
         kw = round(random.uniform(6.0, 7.5), 2)
-        # 5 minutos simulados por segundo:
-        kwh += kw / 3600 * 60 * 5
-        amount = round(kwh * PRICE, 3)
+        kwh += kw / 3600 * 60 # cada ciclo es 1 minuto simulacion
+        amount = round(kwh * PRICE, 2)
 
         telem = {
             "cp_id": CP_ID,
-            "session_id": 1,           
+            "session_id": 1,
             "kw": kw,
             "kwh_total": round(kwh, 3),
             "eur_total": amount
@@ -120,29 +124,30 @@ async def start_charging(producer: AIOKafkaProducer):
         except asyncio.TimeoutError:
             pass
 
-    # Si hay STOP (KO/PARADO/DESCONECTADO o STOP central) no pedimos confirmación
-    if STOP.is_set():
-        reason = "ABORTED"
+
+    aborted = STOP.is_set() and END_REASON is None
+    if STOP_CENTRAL:
+        reason = "FINALIZADO_POR_STOP_DE_CENTRAL"
+    elif HEALTH == "KO":
+        reason = "FINALIZADO_POR_KO_DE_ENGINE"
+    elif END_REASON is not None:
+        reason = END_REASON
     else:
-        while True:
-            resp = (await ask(f"¿Confirmar fin de carga en CP {CP_ID}? (s/n): ")).lower()
-            if resp == "s":
-                break
-            print("⏸ Fin NO confirmado. Reintentando en 5s…")
-            await asyncio.sleep(5)
-        reason = "ENDED"
+        reason = "ABORTED" if aborted else "FINISHED"
 
     end_msg = {
         "cp_id": CP_ID,
         "session_id": 1,
         "kwh": round(kwh, 3),
         "amount_eur": round(kwh * PRICE, 2),
-        "reason": reason
+        "reason": reason,
     }
     await producer.send_and_wait("cp.session_ended", json.dumps(end_msg).encode())
 
-    await send_status(producer, "PARADO" if STOP.is_set() else "ACTIVADO")
-    print("Carga finalizada.")
+    final_status = "PARADO" if aborted else "ACTIVADO"
+    await send_status(producer, final_status)
+
+    print(f"Carga finalizada. reason={reason}, final_status={final_status}")
     print_menu()
     CHARGE_TASK = None
 
@@ -220,11 +225,14 @@ async def menu_loop(producer: AIOKafkaProducer):
                 print(f"Rechazo enviado a CENTRAL para driver {PENDING_AUTH['driver_id']}.")
                 PENDING_AUTH = None
         elif cmd == "6":
+            global END_REASON
             if STATUS != "SUMINISTRANDO" or not (CHARGE_TASK and not CHARGE_TASK.done()):
                 print("No hay ninguna carga en curso.")
             else:
-                STOP.set()
+                END_REASON = "FINALIZADO_CORRECTAMENTE_POR_ENGINE"
+                STOP.set()   # solo para salir del bucle
                 print("Solicitud de finalización de carga enviada.")
+
         else:
             print("Opción no válida.")
         print_menu()
@@ -283,7 +291,7 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
                 writer.write(b"OK"); await writer.drain(); return
             elif action == "KO":
                 HEALTH = "KO"
-                STOP.set()                         # ⬅️ detener si estaba cargando
+                STOP.set()                         #  detener si estaba cargando
                 await send_status(producer, "PARADO")
                 writer.write(b"OK"); await writer.drain(); return
             elif action == "OK":
@@ -318,7 +326,7 @@ async def start_socket_server(producer: AIOKafkaProducer):
 # ESCUCHA A CENTRAL (Kafka)
 # -------------------------------------------------------------
 async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProducer):
-    global CHARGE_TASK, PENDING_AUTH, STATUS, CP_ID, STOP
+    global CHARGE_TASK, PENDING_AUTH, STATUS, CP_ID, STOP, STOP_CENTRAL
     print("👂 Esperando mensajes de CENTRAL...")
     try:
         async for msg in consumer:
@@ -363,7 +371,7 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
 
                 if action == "STOP":
                     STOP.set()
-
+                    STOP_CENTRAL = True
                     # Si estoy suministrando, dejo que start_charging cierre sesión 
                     if STATUS == "SUMINISTRANDO" and CHARGE_TASK and not CHARGE_TASK.done():
                         print(f"Carga detenida por CENTRAL en {CP_ID}")
@@ -375,6 +383,7 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
 
                 elif action == "RESUME":
                     STOP.clear()
+                    STOP_CENTRAL = False
                     # Solo mandamos ACTIVADO si no lo estaba ya
                     if STATUS != "ACTIVADO":
                         await send_status(producer, "ACTIVADO")

@@ -24,10 +24,11 @@ def leer_fichero_cps(path: str):
         print(f"Cargados {len(ids)} CP(s) de {path}")
     return ids
 
-async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, timeout_sesion=180):
+async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4):
     """
-    Lanza una solicitud para un CP y espera a que termine (FINISHED o DENIED/ERROR).
-    Devuelve True si terminó; False si hubo error grave al consumir de Kafka.
+    Lanza una solicitud para un CP y espera indefinidamente a que termine
+    (FINISHED o DENIED/ERROR). Solo sale si llega un estado final o hay un
+    error grave recibiendo de Kafka.
     """
     req_id = str(uuid.uuid4())
 
@@ -42,24 +43,26 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
     )
     print(f"Solicitud enviada → CP={cp} | request_id={req_id}")
 
-    # 2) Espera de esta sesión (updates + telemetrías)
-    loop = asyncio.get_running_loop()
-    fin = loop.time() + timeout_sesion
-
-    while loop.time() < fin:
+    # 2) Espera de esta sesión (SIN límite de tiempo de sesión)
+    while True:
         try:
+            # Solo esperamos 1s cada vez para no bloquear eternamente el getone()
             msg = await asyncio.wait_for(consumer.getone(), timeout=1.0)
         except asyncio.TimeoutError:
+            # 1 segundo sin mensajes → seguimos esperando
             continue
         except Exception as e:
-            print(f"⚠️ Error recibiendo de Kafka: {e}")
+            print(f"Error recibiendo de Kafka: {e}")
             return False
 
         data = msg.value
+
         # Filtrado estricto por este driver y esta request
         if data.get("driver_id") != driver_id or data.get("request_id") != req_id:
+            # Mensaje que no es para esta sesión → lo ignoramos
             continue
 
+        # --- Mensajes de estado ---
         if msg.topic == "driver.update":
             status = (data.get("status") or "").upper()
             message = data.get("message", "")
@@ -69,46 +72,44 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
                 # Rechazado o error → concluimos esta solicitud
                 break
 
-        if status == "FINISHED":
-            summary = data.get("summary", {}) or {}
-            kwh = summary.get("kwh")
-            eur = summary.get("amount_eur")
-            reason = summary.get("reason", "ENDED")
-            loc = summary.get("location", "Desconocida")
-            unit_price = summary.get("price_eur_kwh")
-            cp_from_summary = summary.get("cp_id", cp)
+            if status == "FINISHED":
+                summary = data.get("summary", {}) or {}
+                kwh = summary.get("kwh")
+                eur = summary.get("amount_eur")
+                reason = summary.get("reason", "ENDED")
+                loc = summary.get("location", "Desconocida")
+                unit_price = summary.get("price_eur_kwh")
+                cp_from_summary = summary.get("cp_id", cp)
 
-            # Fallback de cálculo si amount_eur no vino y tenemos precio
-            if eur is None and (kwh is not None) and (unit_price is not None):
-                try:
-                    eur = round(float(kwh) * float(unit_price), 2)
-                except Exception:
-                    pass
+                # Fallback de cálculo si amount_eur no vino y tenemos precio
+                if eur is None and (kwh is not None) and (unit_price is not None):
+                    try:
+                        eur = round(float(kwh) * float(unit_price), 2)
+                    except Exception:
+                        pass
 
-            print("\n===== TICKET DE RECARGA =====")
-            print(f"CP:           {cp_from_summary}")
-            print(f"Localización: {loc}")
-            if unit_price is not None:
-                print(f"Precio/kWh:   {unit_price} €")
-            if kwh is not None:
-                try:
-                    print(f"Energía:      {float(kwh):.4f} kWh")
-                except Exception:
-                    print(f"Energía:      {kwh} kWh")
-            if eur is not None:
-                try:
-                    print(f"Importe:      {float(eur):.2f} €")
-                except Exception:
-                    print(f"Importe:      {eur} €")
-            print(f"Estado:       {reason}")
-            print("=============================\n")
+                print("\n===== TICKET DE RECARGA =====")
+                print(f"CP:           {cp_from_summary}")
+                print(f"Localización: {loc}")
+                if unit_price is not None:
+                    print(f"Precio/kWh:   {unit_price} €")
+                if kwh is not None:
+                    try:
+                        print(f"Energía:      {float(kwh):.4f} kWh")
+                    except Exception:
+                        print(f"Energía:      {kwh} kWh")
+                if eur is not None:
+                    try:
+                        print(f"Importe:      {float(eur):.2f} €")
+                    except Exception:
+                        print(f"Importe:      {eur} €")
+                print(f"Estado:       {reason}")
+                print("=============================\n")
 
-            # Mantén el break para cerrar el bucle de espera de esta solicitud
-            break
+                break  # Terminamos la sesión al recibir FINISHED
 
-
+        # --- Telemetrías ---
         elif msg.topic == "driver.telemetry":
-            # Progreso en tiempo real
             kw = data.get("kw")
             kwh_total = data.get("kwh_total")
             eur_total = data.get("eur_total")
@@ -117,12 +118,10 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4, 
             except Exception:
                 print(f"⚡ {cp} → {kw} kW | {kwh_total} kWh | {eur_total} €")
 
-    else:
-        print("Timeout esperando conclusión; continúo con el siguiente tras 4 s…")
-
     # 3) Pausa entre sesiones (requisito)
     await asyncio.sleep(pausa_entre)
     return True
+
 
 # --------------------------- bucles principales ---------------------------
 
