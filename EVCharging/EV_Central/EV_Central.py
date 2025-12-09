@@ -589,9 +589,9 @@ async def consume_kafka():
                                     {"cp_id": cp_id, "kept": status, "ignored": "ACTIVADO"})
 
                 # Si estaba suministrando y el nuevo estado no permite suministro → cerrar
-                if status in {"AVERIA", "PARADO", "DESCONECTADO"} and cp_id in ACTIVE_SESSIONS:
-                    reason_code = "FAULT" if status == "AVERIA" else ("DISCONNECTED" if status == "DESCONECTADO" else "ABORTED")
-                    await force_close_session(cp_id, reason_code)
+                #if status in {"AVERIA", "PARADO", "DESCONECTADO"} and cp_id in ACTIVE_SESSIONS:
+                 #   reason_code = "FAULT" if status == "AVERIA" else ("DISCONNECTED" if status == "DESCONECTADO" else "ABORTED")
+                  #  await force_close_session(cp_id, reason_code)
 
                 update_cp(cp_id, status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": status})

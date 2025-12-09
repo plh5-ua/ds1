@@ -171,15 +171,19 @@ async def menu_loop(producer: AIOKafkaProducer):
         cmd = (await INPUT_Q.get()).strip()
         if cmd == "1":
             HEALTH = "OK"
-            STOP.clear()
-            await send_status(producer, "ACTIVADO")
-            print("CP ACTIVADO (salud=OK).")
+            if (not STOP_CENTRAL):
+                STOP.clear()
+                await send_status(producer, "ACTIVADO")
+                print("CP ACTIVADO (salud=OK).")
+            else:
+                await send_status(producer, "PARADO")
+                print("CP en estado de salud OK, parado por central.")
 
         elif cmd == "2":
             HEALTH = "KO"
             STOP.set()                         
-            await send_status(producer, "PARADO")
-            print("CP en KO (status PARADO).")
+            await send_status(producer, "AVERIA")
+            print("CP en KO (status AVERIA).")
 
         elif cmd == "3":
             if not CP_ID:
@@ -292,7 +296,7 @@ async def handle_monitor_connection(reader: asyncio.StreamReader, writer: asynci
             elif action == "KO":
                 HEALTH = "KO"
                 STOP.set()                         #  detener si estaba cargando
-                await send_status(producer, "PARADO")
+                await send_status(producer, "AVERIA")
                 writer.write(b"OK"); await writer.drain(); return
             elif action == "OK":
                 HEALTH = "OK"
