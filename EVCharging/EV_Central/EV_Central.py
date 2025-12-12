@@ -26,11 +26,19 @@ from fastapi.responses import HTMLResponse
 from pathlib import Path
 from pydantic import BaseModel
 
-
-
-
 # --- Kafka asíncrono ---
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+
+import os
+import base64
+import hashlib
+import hmac
+import secrets
+
+PEPPER = os.getenv("EV_REGISTRY_PEPPER", "CHANGE_ME")  # MISMO que Registry
+
+AUTHENTICATED_CPS = set()     # cp_id autenticados en CENTRAL
+CP_SECRET_KEYS = {}           # cp_id -> secret_key (base64)
 
 # ---------------------------------------------------------------------------
 # Monitoreo de heartbeats
@@ -84,7 +92,64 @@ def init_db():
         con.executescript(schema)
         con.commit()
 
+#------------------------------
+#funciones parte 2 seguras
+#------------------------------
+def init_central_auth_tables():
+    with closing(get_db()) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS cp_registry_credentials (
+            cp_id TEXT PRIMARY KEY,
+            cred_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            issued_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );
 
+        CREATE TABLE IF NOT EXISTS cp_central_keys (
+            cp_id TEXT PRIMARY KEY,
+            secret_key TEXT NOT NULL,
+            issued_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );
+        """)
+        con.commit()
+
+def hash_cred(cred_plain: str, salt: str) -> str:
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        (cred_plain + PEPPER).encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000
+    )
+    return base64.urlsafe_b64encode(dk).decode().rstrip("=")
+
+def verify_registry_credential(cp_id: str, credential: str) -> bool:
+    with closing(get_db()) as con:
+        row = con.execute(
+            "SELECT cred_hash, salt, revoked FROM cp_registry_credentials WHERE cp_id=?",
+            (cp_id,)
+        ).fetchone()
+        if not row or int(row["revoked"]) == 1:
+            return False
+        expected = row["cred_hash"]
+        salt = row["salt"]
+        got = hash_cred(credential, salt)
+        return hmac.compare_digest(expected, got)
+
+def upsert_secret_key(cp_id: str, secret_key: str):
+    with closing(get_db()) as con:
+        con.execute("""
+            INSERT INTO cp_central_keys(cp_id, secret_key, revoked)
+            VALUES (?,?,0)
+            ON CONFLICT(cp_id) DO UPDATE SET
+                secret_key=excluded.secret_key,
+                issued_at=CURRENT_TIMESTAMP,
+                revoked=0
+        """, (cp_id, secret_key))
+        con.commit()
+
+#funciones p1 db
 def insert_cp(cp_id: str, location: str, price: float = 0.3):
     """Upsert: si existe actualiza location/price; si no, inserta."""
     with closing(get_db()) as con:
@@ -352,6 +417,34 @@ def monitor_socket_server(loop):
 
             action = (msg.get("action") or "").upper()
             cp_id  = msg.get("cp_id")
+            
+            if action == "AUTH":
+                credential = (msg.get("credential") or "").strip()
+
+                # 1) El CP debe existir en BD (si no, no está dado de alta)
+                cp_row = get_cp_from_db(cp_id)
+                if not cp_row:
+                    try: conn.sendall(b"DENIED:NOT_REGISTERED")
+                    except: pass
+                    return
+
+                # 2) Validar credencial contra Registry
+                if not verify_registry_credential(cp_id, credential):
+                    try: conn.sendall(b"DENIED:BAD_CREDENTIAL")
+                    except: pass
+                    return
+
+                # 3) OK -> generar secret_key única por CP
+                secret_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+                CP_SECRET_KEYS[cp_id] = secret_key
+                upsert_secret_key(cp_id, secret_key)
+
+                AUTHENTICATED_CPS.add(cp_id)
+
+                resp = {"ok": True, "cp_id": cp_id, "secret_key": secret_key}
+                try: conn.sendall(json.dumps(resp).encode())
+                except: pass
+                return
 
             if action == "REGISTER":
                 location = msg.get("location", "Desconocida")
@@ -368,6 +461,11 @@ def monitor_socket_server(loop):
                 log_central_msg("REGISTRO_CP", {"cp_id": cp_id, "location": location, "price": price})
 
             elif action == "HEARTBEAT":
+                if cp_id not in AUTHENTICATED_CPS:
+                    try: conn.sendall(b"DENIED:NOT_AUTH")
+                    except: pass
+                    return
+
                 LAST_HEARTBEAT[cp_id] = loop.time()
                 health = (msg.get("health") or "KO").upper()
                 new_status = "ACTIVADO" if health == "OK" else "AVERIA"
@@ -915,6 +1013,7 @@ async def produce_kafka():
 async def main():
     global MAIN_LOOP
     init_db()
+    init_central_auth_tables()
     asyncio.create_task(notify_central_state())
 
     # Al iniciar, marcar todos los CPs como DESCONECTADOS

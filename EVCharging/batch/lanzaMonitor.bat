@@ -5,7 +5,7 @@ rem === CONFIGURACIÓN ===
 set "BASE_PORT=6000"
 set "BROKER=127.0.0.1:9000"
 set "SCRIPT=D:\sd1\ds1\ds1\EVCharging\EV_CP_M\EV_CP_M.py"
-
+set "REGISTRY=127.0.0.1:7070"
 rem === LISTA DE PARKINGS Y PRECIOS (mismo orden) ===
 set names=Parking_A Parking_B Parking_C Parking_D Parking_E
 set prices[1]=0.45
@@ -19,7 +19,7 @@ for %%A in (%names%) do (
     set /a count+=1
     set /a port=!BASE_PORT!+!count!
 
-    rem ⚙️ Expansión indirecta correcta del precio
+    rem  Expansión indirecta correcta del precio
     call set "price=%%prices[!count!]%%"
 
     echo ==============================
@@ -29,8 +29,8 @@ for %%A in (%names%) do (
     echo ==============================
 
     echo CMD: python "%SCRIPT%" 127.0.0.1:!port! %BROKER% !count! %%A !price!
-    start "%%A" cmd /k python "%SCRIPT%" 127.0.0.1:!port! %BROKER% !count! %%A !price!
+    start "%%A" cmd /k python "%SCRIPT%" 127.0.0.1:!port! %BROKER% %REGISTRY% !count! %%A !price! 
     timeout /t 3 /nobreak >nul
 )
-
+"Uso: python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <ip_registry:puerto> <id_cp> <location> <price>"
 endlocal
