@@ -24,12 +24,17 @@ CENTRAL_PORT = int(CENTRAL_PORT)
 REGISTRY_IP, REGISTRY_PORT = REGISTRY_ADDR.split(":")
 REGISTRY_PORT = int(REGISTRY_PORT)
 
-# IMPORTANTE: usa https cuando levantes Registry con SSL
 REGISTRY_BASE = f"https://{REGISTRY_IP}:{REGISTRY_PORT}"
-REGISTRY_VERIFY = False  # pon "cert.pem" cuando tengas certificado/CA
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REGISTRY_VERIFY = os.path.join(BASE_DIR, "cert.pem")
+
 
 CRED_FILE = f"cp_{CP_ID}_credential.json"
 KEY_FILE  = f"cp_{CP_ID}_secretkey.json"
+
+# --- estado heartbeats ---
+HB_TASK: asyncio.Task | None = None
+HB_STOP = asyncio.Event()
 
 
 # -------------------------------------------------------------
@@ -64,7 +69,6 @@ def registry_baja():
     r = requests.delete(url, verify=REGISTRY_VERIFY, timeout=5)
     if r.status_code != 200:
         raise RuntimeError(f"BAJA falló: {r.status_code} {r.text}")
-    # borrar credenciales locales
     for fpath in (CRED_FILE, KEY_FILE):
         try:
             os.remove(fpath)
@@ -114,16 +118,45 @@ def ping_engine():
 
 
 # -------------------------------------------------------------
-# Heartbeats (solo si autenticado)
+# Heartbeats (background)
 # -------------------------------------------------------------
 async def heartbeat_loop():
-    while True:
-        resp = ping_engine()
-        health = "OK" if resp == "OK" else "KO"
-        # Central responderá DENIED si no autenticado (según tu Central)
-        out = send_to_central_and_recv({"action": "HEARTBEAT", "cp_id": CP_ID, "health": health}, timeout=2)
-        print(f"Heartbeat {CP_ID} ({health}) -> Central: {out}")
-        await asyncio.sleep(1)
+    try:
+        while not HB_STOP.is_set():
+            resp = ping_engine()
+            health = "OK" if resp == "OK" else "KO"
+            out = send_to_central_and_recv(
+                {"action": "HEARTBEAT", "cp_id": CP_ID, "health": health},
+                timeout=2
+            )
+            print(f"Heartbeat {CP_ID} ({health}) -> Central: {out}")
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print("⏹ Heartbeats detenidos.")
+
+def start_heartbeats():
+    global HB_TASK
+    if HB_TASK and not HB_TASK.done():
+        print("ℹ️ Heartbeats ya están en marcha.")
+        return
+    HB_STOP.clear()
+    HB_TASK = asyncio.create_task(heartbeat_loop())
+    print("▶ Heartbeats iniciados en background.")
+
+async def stop_heartbeats():
+    global HB_TASK
+    if not HB_TASK or HB_TASK.done():
+        print("ℹ️ Heartbeats no están en marcha.")
+        return
+    HB_STOP.set()
+    HB_TASK.cancel()
+    try:
+        await HB_TASK
+    except asyncio.CancelledError:
+        pass
+    HB_TASK = None
 
 
 # -------------------------------------------------------------
@@ -134,8 +167,7 @@ def print_menu():
     print("1) Dar de alta (Registry REST)")
     print("2) Dar de baja (Registry REST)")
     print("3) Autenticar (Central SOCKET)")
-    print("4) Enviar ID a Engine")
-    print("5) Iniciar Heartbeats")
+    print("4) Parar Heartbeats")
     print("0) Salir")
     print("===========================\n")
 
@@ -144,9 +176,12 @@ async def main():
 
     while True:
         print_menu()
-        op = input("Opción: ").strip()
+
+        # input() bloquea: lo pasamos a un hilo para no bloquear asyncio
+        op = (await asyncio.to_thread(input, "Opción: ")).strip()
 
         if op == "0":
+            await stop_heartbeats()
             return
 
         elif op == "1":
@@ -157,6 +192,7 @@ async def main():
 
         elif op == "2":
             try:
+                await stop_heartbeats()
                 registry_baja()
             except Exception as e:
                 print("❌", e)
@@ -164,7 +200,10 @@ async def main():
         elif op == "3":
             try:
                 cred = load_credential()
-                resp = send_to_central_and_recv({"action": "AUTH", "cp_id": CP_ID, "credential": cred}, timeout=3)
+                resp = send_to_central_and_recv(
+                    {"action": "AUTH", "cp_id": CP_ID, "credential": cred},
+                    timeout=3
+                )
                 if resp.startswith("DENIED"):
                     print("❌ Central denegó:", resp)
                 else:
@@ -172,23 +211,21 @@ async def main():
                     if data.get("ok"):
                         save_secret_key(data["secret_key"])
                         print("✅ Autenticado en Central.")
+                        if send_id_to_engine():
+                            print("✅ Engine ACK.")
+                        else:
+                            print("❌ Engine no respondió ACK.")
+                        if not is_authenticated_local():
+                            print("❌ No autenticado. Primero opción 3 (Autenticar).")
+                            continue
+                        start_heartbeats()
                     else:
                         print("❌ Respuesta inesperada:", resp)
             except Exception as e:
                 print("❌", e)
 
         elif op == "4":
-            if send_id_to_engine():
-                print("✅ Engine ACK.")
-            else:
-                print("❌ Engine no respondió ACK.")
-
-        elif op == "5":
-            if not is_authenticated_local():
-                print("❌ No autenticado. Primero opción 3 (Autenticar).")
-                continue
-            print("▶ Iniciando heartbeats (Ctrl+C para parar el programa)...")
-            await heartbeat_loop()
+            await stop_heartbeats()
 
         else:
             print("Opción no válida.")

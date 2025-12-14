@@ -164,7 +164,13 @@ def get_cp_info(cp_id: str):
     return {"ok": True, "cp": get_cp(cp_id)}
 
 
+# uvicorn EV_Registry:app --host 0.0.0.0 --port 7070 --ssl-keyfile key.pem --ssl-certfile cert.pem
 if __name__ == "__main__":
-    # Para cumplir canal seguro: usa HTTPS al lanzar (recomendado)
-    # uvicorn EV_Registry:app --host 0.0.0.0 --port 7070 --ssl-keyfile key.pem --ssl-certfile cert.pem
-    uvicorn.run(app, host="0.0.0.0", port=REGISTRY_PORT, log_level="info")
+    uvicorn.run(
+        "EV_Registry:app",
+        host="0.0.0.0",
+        port=8443,
+        ssl_certfile="cert.pem",
+        ssl_keyfile="key.pem"
+    )
+
