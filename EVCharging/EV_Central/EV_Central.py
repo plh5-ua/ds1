@@ -99,6 +99,19 @@ def init_db():
 #------------------------------
 #funciones parte 2 seguras
 #------------------------------
+SEEN = set()
+SEEN_Q = deque(maxlen=2000)
+
+def seen_before(key: str) -> bool:  ##evitamos MITM/replay attacks
+    if key in SEEN:
+        return True
+    SEEN.add(key)
+    SEEN_Q.append(key)
+    if len(SEEN_Q) == SEEN_Q.maxlen:
+        old = SEEN_Q.popleft()
+        SEEN.discard(old)
+    return False
+
 def init_central_auth_tables():
     with closing(get_db()) as con:
         con.executescript("""
@@ -276,7 +289,7 @@ def decrypt_secure_envelope(envelope: dict) -> dict:
     # 2) anti-replay simple con timestamp
     ts = int(envelope.get("ts") or 0)
     now = int(time.time())
-    if ts <= 0 or abs(now - ts) > 30:
+    if ts <= 0 or abs(now - ts) > 20:
         raise ValueError("STALE_OR_BAD_TS")
 
     # 3) descifrar
@@ -289,11 +302,39 @@ def decrypt_secure_envelope(envelope: dict) -> dict:
     key = derive_aes_key(secret_key_str)
     aesgcm = AESGCM(key)
 
+    uniq = f"{ts}:{envelope.get('nonce')}"
+    if seen_before(uniq):
+        raise ValueError("REPLAY_DETECTED")
+
     # AAD: ata cp_id y ts a la autenticidad del mensaje
     aad = f"{cp_id}|{ts}".encode("utf-8")
 
     pt = aesgcm.decrypt(nonce, ct, aad)
     return json.loads(pt.decode("utf-8"))
+
+def encrypt_secure_envelope(cp_id: str, plaintext_msg: dict) -> dict:
+    secret_key_str = CP_SECRET_KEYS.get(cp_id)
+    if not secret_key_str:
+        raise ValueError("NO_KEY_FOR_CP")
+
+    ts = int(time.time())
+
+    key = derive_aes_key(secret_key_str)
+    aesgcm = AESGCM(key)
+
+    nonce = os.urandom(12)  # 96 bits recomendado para GCM
+
+    aad = f"{cp_id}|{ts}".encode("utf-8")
+    pt = json.dumps(plaintext_msg, separators=(",", ":")).encode("utf-8")
+    ct = aesgcm.encrypt(nonce, pt, aad)
+
+    return {
+        "action": "SECURE",
+        "cp_id": cp_id,
+        "ts": ts,
+        "nonce": base64.b64encode(nonce).decode("utf-8"),
+        "ciphertext": base64.b64encode(ct).decode("utf-8"),
+    }
 
 # ---------------------------------------------------------------------------
 # FASTAPI + PANEL
@@ -513,8 +554,13 @@ def monitor_socket_server(loop):
                 price    = float(msg.get("price", 0.30))
                 insert_cp(cp_id, location, price)
                 cp_data = get_cp_from_db(cp_id)
-                print(f"🆕 CP registrado desde monitor: {cp_id} ({location}, {price} €/kWh)")
-                try: conn.sendall(b"ACK")
+                print(f"CP registrado desde monitor: {cp_id} ({location}, {price} €/kWh)")
+                try: 
+                    if came_secure:
+                        resp_msg = {"ok": True, "action": "REGISTER_ACK"}
+                        conn.sendall(json.dumps(encrypt_secure_envelope(cp_id, resp_msg)).encode("utf-8"))
+                    else:
+                        conn.sendall(b"ACK")
                 except Exception: pass
                 # notificar panel desde el loop ASYNC
                 asyncio.run_coroutine_threadsafe(
@@ -562,16 +608,13 @@ def monitor_socket_server(loop):
                 # No machacar PARADO/DESCONECTADO con ACTIVADO solo por heartbeat
                 if new_status == "ACTIVADO" and db_status in {"PARADO", "DESCONECTADO"}:
                     try:
-                        conn.sendall(health.encode())
-                    except Exception:
-                        pass
-                    LAST_STATUS_SEEN[cp_id] = prev_status
-                    return
-
-                # Evitar pasar a Activaddo si esta parado esste if es probable
-                if new_status == "ACTIVADO" and db_status == "PARADO":
-                    try:
-                        conn.sendall(health.encode())
+                        if came_secure:
+                            resp_msg = {
+                                "ok": True,
+                                "action": "HEARTBEAT_ACK",
+                                "health": health ## mandamos health para que no cambie el estado
+                                }
+                            conn.sendall(json.dumps(encrypt_secure_envelope(cp_id, resp_msg)).encode("utf-8"))
                     except Exception:
                         pass
                     LAST_STATUS_SEEN[cp_id] = prev_status
@@ -593,7 +636,6 @@ def monitor_socket_server(loop):
                     asyncio.run_coroutine_threadsafe(
                         notify_panel({"type": "heartbeat", **cp_data}), loop,
                     )
-
                     # Actualiza el último estado visto
                     LAST_STATUS_SEEN[cp_id] = new_status
                 else:
@@ -601,16 +643,22 @@ def monitor_socket_server(loop):
                     LAST_STATUS_SEEN[cp_id] = db_status
 
                 try:
-                    conn.sendall(health.encode())
+                    if came_secure:
+                        resp_msg = {
+                            "ok": True,
+                            "action": "HEARTBEAT_ACK",
+                            "health": health 
+                            }
+                        conn.sendall(json.dumps(encrypt_secure_envelope(cp_id, resp_msg)).encode("utf-8"))
                 except Exception:
                     pass
 
-
-
             else:
                 try: conn.sendall(b"NACK")
-                except Exception: pass
-
+                except Exception as e:
+                    print(f"Error enviando NACK a {addr}: {e}")
+                finally:
+                    pass
         except Exception as e:
             print(f"Error procesando monitor desde {addr}: {e}")
         finally:

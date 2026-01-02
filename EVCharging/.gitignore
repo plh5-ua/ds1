@@ -34,3 +34,6 @@ Thumbs.db
 # basedata+
 *.db
 EV_Central/evcentral.dbEV_Central/*.db
+
+# los .json
+*.json

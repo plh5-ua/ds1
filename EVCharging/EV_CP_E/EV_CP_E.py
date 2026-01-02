@@ -117,7 +117,7 @@ async def start_charging(producer: AIOKafkaProducer):
             "eur_total": amount
         }
         await producer.send_and_wait("cp.telemetry", json.dumps(telem).encode())
-        print(f"{CP_ID}: {kw} kW — {amount:.3f} €")
+        print(f"{CP_ID}: {kw} kW — {amount:.2f} €")
 
         try:
             await asyncio.wait_for(STOP.wait(), timeout=1.0)

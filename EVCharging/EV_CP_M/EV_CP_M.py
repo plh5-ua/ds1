@@ -74,6 +74,41 @@ def encrypt_to_secure_envelope(plain_obj: dict) -> dict:
         "ciphertext": base64.b64encode(ct).decode("ascii"),
     }
 
+def decrypt_from_secure_envelope(envelope: dict) -> dict:
+    """
+    Recibe {"action":"SECURE","cp_id":..., "ts":..., "nonce":..., "ciphertext":...}
+    y devuelve el JSON original (dict) ya descifrado.
+    """
+    cp_id = envelope.get("cp_id")
+    if not cp_id:
+        raise ValueError("NO_CP_ID")
+
+    #comprobar que es para este cp
+    if str(cp_id) != str(CP_ID):
+        raise ValueError("CP_ID_MISMATCH")
+
+    ts = int(envelope.get("ts") or 0)
+    if ts <= 0:
+        raise ValueError("BAD_TS")
+
+    nonce_b64 = envelope.get("nonce") or ""
+    ct_b64 = envelope.get("ciphertext") or ""
+    if not nonce_b64 or not ct_b64:
+        raise ValueError("MISSING_FIELDS")
+
+    nonce = base64.b64decode(nonce_b64)
+    ct = base64.b64decode(ct_b64)
+
+    secret_key_str = load_secret_key_str()
+    key = derive_aes_key(secret_key_str)
+    aesgcm = AESGCM(key)
+
+    # Tiene que coincidir con el AAD que usa Central al cifrar respuestas
+    aad = f"{cp_id}|{ts}".encode("utf-8")
+
+    pt = aesgcm.decrypt(nonce, ct, aad)
+    return json.loads(pt.decode("utf-8"))
+
 
 # -------------------------------------------------------------
 # CENTRAL (socket)
@@ -97,36 +132,34 @@ def _recv_all_with_timeout(sock: socket.socket, max_bytes: int = 65536) -> bytes
             break
     return b"".join(chunks)
 
-def send_to_central_and_recv(message, timeout=3) -> str:
+def send_to_central_and_recv(message, timeout=3) -> dict | str:
     action = (message.get("action") or "").upper()
+    sent_secure = (action != "AUTH")
 
-    # AUTH en claro, el resto cifrado
-    if action != "AUTH":
+    if sent_secure:
         if not is_authenticated_local():
             raise RuntimeError("No autenticado: no puedo enviar cifrado.")
         message = encrypt_to_secure_envelope(message)
 
-    payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect((CENTRAL_IP, CENTRAL_PORT))
+        s.sendall(json.dumps(message).encode("utf-8"))
+        data = _recv_all_with_timeout(s, max_bytes=65536)
+        if not data:
+            return ""
 
-        # Enviar todo
-        s.sendall(payload)
+    raw = data.decode("utf-8")
 
-        # Leer respuesta completa (o hasta timeout/cierre)
-        data = _recv_all_with_timeout(s)
+    # Si mandé cifrado, espero respuesta cifrada
+    if sent_secure:
+        env = json.loads(raw)
+        if (env.get("action") or "").upper() != "SECURE":
+            raise RuntimeError(f"Respuesta no cifrada inesperada: {raw}")
+        return decrypt_from_secure_envelope(env)  # devuelve dict en claro
 
-    # Decodificar respuesta
-    if not data:
-        return ""
-
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        # por si central manda algo raro (no debería)
-        return data.decode("utf-8", errors="replace")
+    # AUTH (en claro)
+    return raw
 
 
 
@@ -286,24 +319,24 @@ async def main():
                     timeout=3
                 )
                 if resp.startswith("DENIED"):
-                    print("❌ Central denegó:", resp)
+                    print("Central denegó:", resp)
                 else:
                     data = json.loads(resp)
                     if data.get("ok"):
                         save_secret_key(data["secret_key"])
-                        print("✅ Autenticado en Central.")
+                        print("Autenticado en Central.")
                         if send_id_to_engine():
-                            print("✅ Engine ACK.")
+                            print("Engine ACK.")
                         else:
-                            print("❌ Engine no respondió ACK.")
+                            print("Engine no respondió ACK.")
                         if not is_authenticated_local():
-                            print("❌ No autenticado. Primero opción 3 (Autenticar).")
+                            print("No autenticado. Primero opción 3 (Autenticar).")
                             continue
                         start_heartbeats()
                     else:
-                        print("❌ Respuesta inesperada:", resp)
+                        print("Respuesta inesperada:", resp)
             except Exception as e:
-                print("❌", e)
+                print("Excepción: ", e)
 
         elif op == "4":
             await stop_heartbeats()
