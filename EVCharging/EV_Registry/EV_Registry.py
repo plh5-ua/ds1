@@ -21,7 +21,9 @@ PEPPER = os.getenv("EV_REGISTRY_PEPPER", "CHANGE_ME")
 
 app = FastAPI(title="EV_Registry", version="1.0")
 
-
+# ---------------------------------------------------------------------------
+# BASE DE DATOS SQLITE
+# ---------------------------------------------------------------------------
 def get_db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -46,6 +48,13 @@ def init_registry_tables():
         """)
         con.commit()
 
+def insert_audit_log(ip_auditor: str, name_auditor: str, action: str, details: str = None):
+    with closing(get_db()) as con:
+        con.execute("""
+            INSERT INTO audit_log(ip_auditor, name_auditor, action, details)
+            VALUES (?,?,?,?)
+        """, (ip_auditor, name_auditor, action, details))
+        con.commit()
 
 def hash_cred(cred_plain: str, salt: str) -> str:
     dk = hashlib.pbkdf2_hmac(
@@ -154,6 +163,7 @@ def baja_cp(cp_id: str):
     cp_id = cp_id.strip()
     # si no existe, 404
     _ = get_cp(cp_id)
+    #insert_audit_log()
     revoke_credential(cp_id)
     mark_cp_disconnected(cp_id)
     return {"ok": True, "cp_id": cp_id, "revoked": True, "status": "DESCONECTADO"}

@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL,   -- HEARTBEAT | STATUS | TELEMETRY | COMMAND | AUTH | ERROR
     payload TEXT NOT NULL
 );
--- Historial de cambios en charging_points
+-- Historial de cambios en charging_pointsS
 CREATE TABLE IF NOT EXISTS charging_points_history (
     id TEXT,  -- igual que charging_points.id
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS charging_points_history (
     old_price_eur_kwh REAL,
     new_price_eur_kwh REAL,
     action TEXT   -- 'UPDATE', 'INSERT', 'DELETE'
+);
+-- Tabla para registrar las auditorías 
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ip_auditor TEXT NOT NULL,
+    name_auditor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT
 );
 
 CREATE TRIGGER IF NOT EXISTS log_cp_update
