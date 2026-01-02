@@ -5,6 +5,11 @@ import sys
 import socket
 import os
 import requests
+import time
+import base64
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 if len(sys.argv) < 7:
     print("Uso: python EV_CP_M.py <ip_engine:puerto> <ip_central:puerto> <ip_registry:puerto> <id_cp> <location> <price>")
@@ -36,17 +41,93 @@ KEY_FILE  = f"cp_{CP_ID}_secretkey.json"
 HB_TASK: asyncio.Task | None = None
 HB_STOP = asyncio.Event()
 
+# -------------------------------------------------------------
+# CIFRADO AES-GCM
+# -------------------------------------------------------------
+def load_secret_key_str() -> str:
+    if not os.path.exists(KEY_FILE):
+        raise RuntimeError("No hay secret_key. Autentica primero.")
+    with open(KEY_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)["secret_key"]
+
+def derive_aes_key(secret_key_str: str) -> bytes:
+    return hashlib.sha256(secret_key_str.encode("utf-8")).digest()
+
+def encrypt_to_secure_envelope(plain_obj: dict) -> dict:
+    secret_key_str = load_secret_key_str()
+    key = derive_aes_key(secret_key_str)
+    aesgcm = AESGCM(key)
+
+    nonce = os.urandom(12)
+    ts = int(time.time())
+
+    plaintext = json.dumps(plain_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    aad = f"{CP_ID}|{ts}".encode("utf-8")
+
+    ct = aesgcm.encrypt(nonce, plaintext, aad)
+
+    return {
+        "action": "SECURE",
+        "cp_id": CP_ID,
+        "ts": ts,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ct).decode("ascii"),
+    }
+
 
 # -------------------------------------------------------------
 # CENTRAL (socket)
 # -------------------------------------------------------------
+def _recv_all_with_timeout(sock: socket.socket, max_bytes: int = 65536) -> bytes:
+    """
+    Lee hasta que el servidor cierre o hasta agotar timeout.
+    """
+    chunks = []
+    total = 0
+    while True:
+        try:
+            part = sock.recv(4096)
+        except socket.timeout:
+            break
+        if not part:
+            break
+        chunks.append(part)
+        total += len(part)
+        if total >= max_bytes:
+            break
+    return b"".join(chunks)
+
 def send_to_central_and_recv(message, timeout=3) -> str:
+    action = (message.get("action") or "").upper()
+
+    # AUTH en claro, el resto cifrado
+    if action != "AUTH":
+        if not is_authenticated_local():
+            raise RuntimeError("No autenticado: no puedo enviar cifrado.")
+        message = encrypt_to_secure_envelope(message)
+
+    payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect((CENTRAL_IP, CENTRAL_PORT))
-        s.sendall(json.dumps(message).encode())
-        data = s.recv(4096)
-        return data.decode() if data else ""
+
+        # Enviar todo
+        s.sendall(payload)
+
+        # Leer respuesta completa (o hasta timeout/cierre)
+        data = _recv_all_with_timeout(s)
+
+    # Decodificar respuesta
+    if not data:
+        return ""
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        # por si central manda algo raro (no debería)
+        return data.decode("utf-8", errors="replace")
+
 
 
 # -------------------------------------------------------------

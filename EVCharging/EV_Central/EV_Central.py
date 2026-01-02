@@ -35,6 +35,10 @@ import hashlib
 import hmac
 import secrets
 
+#---- Cifras y autenticación ----
+import time
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 PEPPER = os.getenv("EV_REGISTRY_PEPPER", "CHANGE_ME")  # MISMO que Registry
 
 AUTHENTICATED_CPS = set()     # cp_id autenticados en CENTRAL
@@ -252,6 +256,46 @@ def end_session(session_id, kwh, amount_eur, ended_status="ENDED"):
 
 
 # ---------------------------------------------------------------------------
+# AUTH y cifrado
+# ---------------------------------------------------------------------------
+
+def derive_aes_key(secret_key_str: str) -> bytes:
+    # 32 bytes -> AES-256
+    return hashlib.sha256(secret_key_str.encode("utf-8")).digest()
+
+def decrypt_secure_envelope(envelope: dict) -> dict:
+    cp_id = envelope.get("cp_id")
+    if not cp_id:
+        raise ValueError("NO_CP_ID")
+
+    # 1) comprobar que hay clave para ese CP
+    secret_key_str = CP_SECRET_KEYS.get(cp_id)
+    if not secret_key_str:
+        raise ValueError("NO_KEY_FOR_CP")
+
+    # 2) anti-replay simple con timestamp
+    ts = int(envelope.get("ts") or 0)
+    now = int(time.time())
+    if ts <= 0 or abs(now - ts) > 30:
+        raise ValueError("STALE_OR_BAD_TS")
+
+    # 3) descifrar
+    nonce_b64 = envelope.get("nonce") or ""
+    ct_b64 = envelope.get("ciphertext") or ""
+
+    nonce = base64.b64decode(nonce_b64)
+    ct = base64.b64decode(ct_b64)
+
+    key = derive_aes_key(secret_key_str)
+    aesgcm = AESGCM(key)
+
+    # AAD: ata cp_id y ts a la autenticidad del mensaje
+    aad = f"{cp_id}|{ts}".encode("utf-8")
+
+    pt = aesgcm.decrypt(nonce, ct, aad)
+    return json.loads(pt.decode("utf-8"))
+
+# ---------------------------------------------------------------------------
 # FASTAPI + PANEL
 # ---------------------------------------------------------------------------
 
@@ -418,6 +462,20 @@ def monitor_socket_server(loop):
             action = (msg.get("action") or "").upper()
             cp_id  = msg.get("cp_id")
             
+            came_secure = False
+
+            # Si llega cifrado, lo desciframos y reemplazamos msg/action/cp_id
+            if action == "SECURE":
+                try:
+                    msg = decrypt_secure_envelope(msg)
+                except Exception:
+                    try: conn.sendall(b"DENIED:BAD_SECURE_MESSAGE")
+                    except: pass
+                    return
+                came_secure = True
+                action = (msg.get("action") or "").upper()
+                cp_id  = msg.get("cp_id")
+
             if action == "AUTH":
                 credential = (msg.get("credential") or "").strip()
 
@@ -447,6 +505,10 @@ def monitor_socket_server(loop):
                 return
 
             if action == "REGISTER":
+                if not came_secure:
+                    try: conn.sendall(b"DENIED:REQUIRE_SECURE")
+                    except: pass
+                    return
                 location = msg.get("location", "Desconocida")
                 price    = float(msg.get("price", 0.30))
                 insert_cp(cp_id, location, price)
@@ -461,6 +523,10 @@ def monitor_socket_server(loop):
                 log_central_msg("REGISTRO_CP", {"cp_id": cp_id, "location": location, "price": price})
 
             elif action == "HEARTBEAT":
+                if not came_secure:
+                    try: conn.sendall(b"DENIED:REQUIRE_SECURE")
+                    except: pass
+                    return
                 if cp_id not in AUTHENTICATED_CPS:
                     try: conn.sendall(b"DENIED:NOT_AUTH")
                     except: pass
