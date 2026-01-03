@@ -21,6 +21,7 @@ from datetime import datetime
 # --- FastAPI / WebSocket ---
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
+from requests import request
 import uvicorn
 from fastapi.responses import HTMLResponse
 from pathlib import Path
@@ -166,6 +167,15 @@ def upsert_secret_key(cp_id: str, secret_key: str):
         """, (cp_id, secret_key))
         con.commit()
 
+#AUDIT LOG
+def insert_audit_log(ip_auditor: str, name_auditor: str, action: str, details: str = None):
+    with closing(get_db()) as con:
+        con.execute("""
+            INSERT INTO audit_log(ip_auditor, name_auditor, action, details)
+            VALUES (?,?,?,?)
+        """, (ip_auditor, name_auditor, action, details))
+        con.commit()
+
 #funciones p1 db
 def insert_cp(cp_id: str, location: str, price: float = 0.3):
     """Upsert: si existe actualiza location/price; si no, inserta."""
@@ -228,6 +238,10 @@ def db_get_cp(con, cp_id):
         (cp_id,)
     ).fetchone()
 
+def get_cp_ip_from_db(con, cp_id):
+    with closing(get_db()) as con:
+        row = con.execute("SELECT * FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+        return dict(row) if row else None
 
 def log_event(cp_id, driver_id, etype, payload):
     with closing(get_db()) as con:
@@ -523,13 +537,19 @@ def monitor_socket_server(loop):
                 # 1) El CP debe existir en BD (si no, no está dado de alta)
                 cp_row = get_cp_from_db(cp_id)
                 if not cp_row:
-                    try: conn.sendall(b"DENIED:NOT_REGISTERED")
+                    try: 
+                        conn.sendall(b"DENIED:NOT_REGISTERED")
+                        insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "AUTH_FAIL", "CP no registrado en CENTRAL por falta de alta previa")
+                        log_central_msg("AUTH_FAIL", {"cp_id": cp_id, "reason": "NOT_REGISTERED"})
                     except: pass
                     return
 
                 # 2) Validar credencial contra Registry
                 if not verify_registry_credential(cp_id, credential):
-                    try: conn.sendall(b"DENIED:BAD_CREDENTIAL")
+                    try: 
+                        conn.sendall(b"DENIED:BAD_CREDENTIAL")
+                        insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "AUTH_FAIL", "CP no registrado en CENTRAL por credencial inválida")
+                        log_central_msg("AUTH_FAIL", {"cp_id": cp_id, "reason": "BAD_CREDENTIAL"})
                     except: pass
                     return
 
@@ -537,14 +557,17 @@ def monitor_socket_server(loop):
                 secret_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
                 CP_SECRET_KEYS[cp_id] = secret_key
                 upsert_secret_key(cp_id, secret_key)
+                insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "AUTH_SUCCESS", "CP autenticado correctamente en CENTRAL")
 
+                location = msg.get("location")
+                price    = msg.get("price")
+                log_central_msg("AUTH_SUCCESS", {"cp_id": cp_id, "location": location, "price": price})
                 AUTHENTICATED_CPS.add(cp_id)
 
                 resp = {"ok": True, "cp_id": cp_id, "secret_key": secret_key}
                 try: conn.sendall(json.dumps(resp).encode())
                 except: pass
                 return
-
             if action == "REGISTER":
                 if not came_secure:
                     try: conn.sendall(b"DENIED:REQUIRE_SECURE")
@@ -570,11 +593,14 @@ def monitor_socket_server(loop):
 
             elif action == "HEARTBEAT":
                 if not came_secure:
-                    try: conn.sendall(b"DENIED:REQUIRE_SECURE")
+                    try: 
+                        conn.sendall(b"DENIED:REQUIRE_SECURE")
                     except: pass
                     return
                 if cp_id not in AUTHENTICATED_CPS:
-                    try: conn.sendall(b"DENIED:NOT_AUTH")
+                    try: 
+                        conn.sendall(b"DENIED:NOT_AUTH")
+                        insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "HEARTBEAT_FAIL", "CP no autenticado intentando enviar heartbeat")
                     except: pass
                     return
 
@@ -593,6 +619,10 @@ def monitor_socket_server(loop):
 
                 # Si entra en KO mientras suministra → STOP inmediato
                 if health == "KO" and db_status == "SUMINISTRANDO":
+                    row = get_cp_from_db(cp_id)
+
+                    insert_audit_log(msg.get("ip") or row.get("ip") or "unknown", "CP_M_"+cp_id, "FORCE_STOP", "CP en AVERIA mientras suministraba, forzando STOP")
+                    log_central_msg("FORCE_STOP", {"cp_id": cp_id, "reason": "CP en AVERIA mientras suministraba, forzando STOP"}) 
                     asyncio.run_coroutine_threadsafe(
                         kafka_producer.send_and_wait(
                             "central.command",
@@ -625,8 +655,10 @@ def monitor_socket_server(loop):
                     # --- LOG de transición (una sola vez por cambio) ---
                     if prev_status != new_status:
                         if prev_status == "AVERIA" and new_status == "ACTIVADO":
+                            insert_audit_log(msg.get("ip") or "unknown", "CP_E_"+cp_id, "FAULT_FIXED", "CP en AVERIA -> ACTIVADO")
                             log_central_msg("AVERIA SOLUCIONADA", {"cp_id": cp_id, "from": prev_status, "to": new_status})
                         elif prev_status == "ACTIVADO" and new_status == "AVERIA":
+                            insert_audit_log(msg.get("ip") or "unknown", "CP_E_"+cp_id, "FAULT_ENGINE", "CP en AVERIA")
                             log_central_msg("AVERIA", {"cp_id": cp_id, "from": prev_status, "to": new_status})
 
                     # Persistir y notificar
@@ -688,6 +720,9 @@ async def monitor_disconnections():
                     cp_data["status"] = "DESCONECTADO"
                     await notify_panel({"type": "heartbeat", **cp_data})
                 log_central_msg("DISCONNECTED", {"cp_id": cp_id, "since_sec": HEARTBEAT_TIMEOUT})
+
+                row = get_cp_from_db(cp_id)
+                insert_audit_log(row.get("ip") or "unknown", "CP_E_"+cp_id, "DISCONNECTED", f"CP no envió heartbeats en tiempo, since_sec: {HEARTBEAT_TIMEOUT}")
                 del LAST_HEARTBEAT[cp_id]
 
 
@@ -722,6 +757,7 @@ async def force_close_session(cp_id: str, reason_code: str):
     cp_row = get_cp_from_db(cp_id) or {}
     location = cp_row.get("location")
     unit_price = cp_row.get("price_eur_kwh")
+    ip = cp_row.get("ip")
 
     # Cierra en BD con el código indicado
     end_session(sess["session_id"], kwh_final, eur_final, ended_status=reason_code)
@@ -747,6 +783,8 @@ async def force_close_session(cp_id: str, reason_code: str):
         "cp_id": cp_id, "reason": reason_code,
         "driver_id": sess["driver_id"], "kwh": kwh_final, "amount_eur": eur_final
     })
+
+    insert_audit_log(ip or "unknown", "CP_E_"+cp_id, "SESSION_ENDED", f"Sesión {sess['session_id']} cerrada por {reason_code}, kwh: {kwh_final}, eur: {eur_final}")
 
     await notify_panel({
         "type": "session.ended",
@@ -799,6 +837,8 @@ async def consume_kafka():
                     status = "PARADO" if cur not in {"AVERIA", "DESCONECTADO"} else cur
                     log_central_msg("STOP_GLOBAL_FILTER",
                                     {"cp_id": cp_id, "kept": status, "ignored": "ACTIVADO"})
+                    broker_ip, _ = KAFKA_BOOTSTRAP.split(":")
+                    insert_audit_log(broker_ip, "CENTRAL", "STOP_GLOBAL_FILTER", "STOP GLOBAL activo")
 
                 # Si estaba suministrando y el nuevo estado no permite suministro → cerrar
                 #if status in {"AVERIA", "PARADO", "DESCONECTADO"} and cp_id in ACTIVE_SESSIONS:
@@ -811,7 +851,7 @@ async def consume_kafka():
 
 
             elif topic == "driver.request":
-                req_cp = data["cp_id"]; req_driver = data["driver_id"]; req_id = data["request_id"]
+                req_cp = data["cp_id"]; req_driver = data["driver_id"]; req_id = data["request_id"]; ip = data["ip"]
                 print(f"[driver.request] {data}")
 
                 # Ocupado
@@ -861,6 +901,7 @@ async def consume_kafka():
                 log_central_msg("SUMINISTRO_SOLICITADO", {                         # mensaje central
                     "cp_id": req_cp, "driver_id": req_driver, "session_id": session_id
                 })
+                insert_audit_log(ip, "DRIVER_"+req_driver, "SESSION_STARTED", f"Sesión {session_id} iniciada en CP {req_cp}")
 
                 # 4) Avisar a Engine y Driver
                 await kafka_producer.send_and_wait("central.authorize", json.dumps({
@@ -989,6 +1030,8 @@ async def consume_kafka():
                         "driver_id": sess["driver_id"], 
                         "kwh": kwh_final, "amount_eur": amount_final})
                     
+                    row = get_cp_from_db(cp_id)
+                    insert_audit_log(row.get("ip") or "unknown", "CP_E_"+cp_id, "SESSION_ENDED", f"Sesión {sess['session_id']} finalizada, kwh: {kwh_final}, eur: {amount_final}, reason: {reason}")
                     # borra del panel de sesiones iniciadas
                     await notify_panel({
                         "type": "session.ended",
@@ -1048,6 +1091,9 @@ async def consume_kafka():
                 started_item = {"ts": now_iso(), "cp_id": acc_cp, "driver_id": acc_drv, "session_id": session_id}
                 RECENT_SESSIONS.appendleft(started_item)
                 log_central_msg("SUMINISTRO_MANUAL_INICIADO", {"cp_id": acc_cp, "driver_id": acc_drv, "session_id": session_id})
+
+                row = get_cp_from_db(acc_cp)
+                insert_audit_log(row.get("ip") or "unknown", "CP_E_"+acc_cp, "MANUAL_SESSION_STARTED", f"Sesión manual {session_id} iniciada en CP {acc_cp} para driver {acc_drv}")    
             elif topic == "engine.reject":
                 rej_cp   = data.get("cp_id")
                 rej_drv  = data.get("driver_id")
@@ -1058,6 +1104,8 @@ async def consume_kafka():
                 if not sess:
                     # No hay sesión activa: solo loguea
                     log_central_msg("ENGINE_RECHAZA_SUMINISTRO", {"cp_id": rej_cp, "driver_id": rej_drv, "reason": "no active session"})
+                    row = get_cp_from_db(rej_cp)
+                    insert_audit_log(row.get("ip") or "unknown", "CP_E_"+rej_cp, "ENGINE_REJECT_NO_SESSION", f"Engine rechazó suministro en CP {rej_cp} pero no había sesión activa")
                 else:
                     # comprobar coincidencia (si no coincide, también se limpia por seguridad)
                     if (sess.get("driver_id") == rej_drv) and (sess.get("request_id") == rej_req):
@@ -1101,12 +1149,16 @@ async def consume_kafka():
                         log_central_msg("SUMINISTRO_RECHAZADO", {
                             "cp_id": rej_cp, "driver_id": rej_drv, "request_id": rej_req
                         })
+                        row = get_cp_from_db(rej_cp)
+                        insert_audit_log(row.get("ip") or "unknown", "CP_E_"+rej_cp, "ENGINE_REJECTED", f"Engine rechazó suministro en CP {rej_cp} para driver {rej_drv}, sesión {sess['session_id']}")
                     else:
                         ACTIVE_SESSIONS.pop(rej_cp, None)
                         update_cp(rej_cp, "ACTIVADO")
                         log_central_msg("ENGINE_REJECT_MISMATCH", {
                             "cp_id": rej_cp, "driver_id": rej_drv, "request_id": rej_req
                         })
+                        row = get_cp_from_db(rej_cp)
+                        insert_audit_log(row.get("ip") or "unknown", "CP_E_"+rej_cp, "ENGINE_REJECT_MISMATCH", f"Engine rechazó suministro en CP {rej_cp} pero driver/request no coinciden con sesión activa")
 
 
 

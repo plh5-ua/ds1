@@ -5,6 +5,17 @@ from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 USO = "Uso: python EV_Driver.py <broker_ip:puerto> <id_cliente> [fichero_cp_ids]"
 
 # --------------------------- utilidades ---------------------------
+import socket
+
+def get_reported_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "0.0.0.0"
+    finally:
+        s.close()
 
 def leer_fichero_cps(path: str):
     """Lee un fichero de texto con CPs (uno por línea). Devuelve lista de IDs."""
@@ -38,7 +49,8 @@ async def solicitar_una_carga(producer, consumer, driver_id, cp, pausa_entre=4):
         json.dumps({
             "cp_id": cp,
             "driver_id": driver_id,
-            "request_id": req_id
+            "request_id": req_id,
+            "ip": get_reported_ip()
         }).encode()
     )
     print(f"Solicitud enviada → CP={cp} | request_id={req_id}")

@@ -5,6 +5,7 @@ PRAGMA foreign_keys = ON;
 -- Tabla de puntos de recarga (Charging Points)
 CREATE TABLE IF NOT EXISTS charging_points (
     id TEXT PRIMARY KEY,
+    ip TEXT NOT NULL,
     location TEXT NOT NULL,
     price_eur_kwh REAL NOT NULL CHECK (price_eur_kwh >= 0),
     status TEXT NOT NULL DEFAULT 'DESCONECTADO', -- ACTIVADO, PARADO, SUMINISTRANDO, AVERIADO, DESCONECTADO

@@ -92,19 +92,19 @@ def revoke_credential(cp_id: str):
         con.commit()
 
 
-def upsert_cp(cp_id: str, location: str, price: float):
+def upsert_cp(cp_id: str, location: str, price: float, ip: str):
     with closing(get_db()) as con:
         cur = con.cursor()
         row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
         if row:
             cur.execute(
-                "UPDATE charging_points SET location=?, price_eur_kwh=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (location, price, cp_id),
+                "UPDATE charging_points SET location=?, price_eur_kwh=?, ip=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (location, price, ip, cp_id),
             )
         else:
             cur.execute(
-                "INSERT INTO charging_points(id, location, price_eur_kwh, status) VALUES (?,?,?, 'DESCONECTADO')",
-                (cp_id, location, price),
+                "INSERT INTO charging_points(id, location, price_eur_kwh, ip, status) VALUES (?,?,?,?, 'DESCONECTADO')",
+                (cp_id, location, price, ip),
             )
         con.commit()
 
@@ -128,6 +128,7 @@ def get_cp(cp_id: str) -> Dict[str, Any]:
 
 class AltaReq(BaseModel):
     cp_id: str = Field(..., min_length=1)
+    ip: str = Field(..., min_length=7)
     location: str = Field(..., min_length=1)
     price: float = Field(0.30, ge=0.0)
 
@@ -148,7 +149,8 @@ def alta_cp(cp_id: str, payload: AltaReq):
     if payload.cp_id.strip() != cp_id:
         raise HTTPException(status_code=400, detail="cp_id del path y body no coinciden")
 
-    upsert_cp(cp_id, payload.location.strip(), float(payload.price))
+    upsert_cp(cp_id, payload.location.strip(), float(payload.price), payload.ip.strip())
+    insert_audit_log(payload.ip.strip(), "CP_M_"+cp_id, "ALTA_CP", f"CP dado de alta correctamente -> Location: {payload.location}, Price: {payload.price}")
     cred = issue_credential(cp_id)
 
     return {
@@ -161,12 +163,12 @@ def alta_cp(cp_id: str, payload: AltaReq):
 @app.delete("/cp/{cp_id}")
 def baja_cp(cp_id: str):
     cp_id = cp_id.strip()
-    # si no existe, 404
     _ = get_cp(cp_id)
-    #insert_audit_log()
     revoke_credential(cp_id)
+    insert_audit_log("CP_M_"+cp_id, "BAJA_CP", f"CP dado de baja correctamente -> Location: {get_cp(cp_id)['location']}, Price: {get_cp(cp_id)['price_eur_kwh']}")   
     mark_cp_disconnected(cp_id)
     return {"ok": True, "cp_id": cp_id, "revoked": True, "status": "DESCONECTADO"}
+
 
 
 @app.get("/cp/{cp_id}")
