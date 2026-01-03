@@ -19,7 +19,7 @@ from collections import deque
 from datetime import datetime
 
 # --- FastAPI / WebSocket ---
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from requests import request
 import uvicorn
@@ -132,6 +132,22 @@ def init_central_auth_tables():
         );
         """)
         con.commit()
+def revoke_secret_key(cp_id: str):
+    with closing(get_db()) as con:
+        con.execute(
+            "UPDATE cp_central_keys SET revoked=1 WHERE cp_id=?",
+            (cp_id,)
+        )
+        con.commit()
+
+
+        con.commit()
+def revoke_cp_keys_everywhere(cp_id: str):
+    revoke_secret_key(cp_id)      
+
+    CP_SECRET_KEYS.pop(cp_id, None)
+    AUTHENTICATED_CPS.discard(cp_id)
+    update_cp(cp_id, "DESCONECTADO")
 
 def hash_cred(cred_plain: str, salt: str) -> str:
     dk = hashlib.pbkdf2_hmac(
@@ -325,11 +341,25 @@ def decrypt_secure_envelope(envelope: dict) -> dict:
 
     pt = aesgcm.decrypt(nonce, ct, aad)
     return json.loads(pt.decode("utf-8"))
+def load_secret_key_from_db(cp_id: str) -> str | None:
+    with closing(get_db()) as con:
+        row = con.execute(
+            "SELECT secret_key, revoked FROM cp_central_keys WHERE cp_id=?",
+            (cp_id,)
+        ).fetchone()
+        if not row:
+            return None
+        if int(row["revoked"]) == 1:
+            return None
+        return row["secret_key"]
 
 def encrypt_secure_envelope(cp_id: str, plaintext_msg: dict) -> dict:
     secret_key_str = CP_SECRET_KEYS.get(cp_id)
     if not secret_key_str:
-        raise ValueError("NO_KEY_FOR_CP")
+        secret_key_str = load_secret_key_from_db(cp_id)
+        if not secret_key_str:
+            raise ValueError("NO_KEY_FOR_CP_OR_REVOKED")
+        CP_SECRET_KEYS[cp_id] = secret_key_str
 
     ts = int(time.time())
 
@@ -422,6 +452,23 @@ async def shutdown_event():
     except Exception as e:
         print("Error cerrando Kafka:", e)
 
+@app.post("/central/revoke_key/{cp_id}")
+async def api_revoke_key(cp_id: str):
+    cp_id = cp_id.strip()
+
+    cp = get_cp_from_db(cp_id)
+    if not cp:
+        raise HTTPException(status_code=404, detail="CP no existe")
+
+    if cp_id in ACTIVE_SESSIONS:
+        await force_close_session(cp_id, "KEY_REVOKED")
+
+    revoke_cp_keys_everywhere(cp_id)
+
+    log_central_msg("KEY_REVOKED", {"cp_id": cp_id})
+    await notify_panel({"type": "key.revoked", "cp_id": cp_id})
+
+    return {"ok": True, "cp_id": cp_id, "revoked": True}
 
 async def notify_panel(event: Dict[str, Any]):
     dead = []

@@ -19,6 +19,8 @@
     button.stop { background: orange; color: white; }
     button.resume { background: #28a745; color: white; }
     button.global { margin: 5px; padding: 8px 12px; }
+    button.revoke { background: #dc3545; color: white; } /* rojo */
+
   </style>
 </head>
 <body>
@@ -121,7 +123,9 @@
           <td>
             <button class="stop" onclick="sendCommand('STOP', '${cp.id}')">STOP</button>
             <button class="resume" onclick="sendCommand('RESUME', '${cp.id}')">RESUME</button>
+            <button class="revoke" onclick="revokeKey('${cp.id}')">REVOKE KEY</button>
           </td>
+
         `;
         tableBody.appendChild(row);
         return;
@@ -235,6 +239,17 @@
         console.error('Error sending command:', err);
       }
     }
+    async function revokeKey(cpId) {
+      try {
+        await fetch(`/central/revoke_key/${cpId}`, {
+          method: "POST"
+        });
+
+      } catch (e) {
+        console.error("Error revocando clave:", e);
+      }
+    }
+
 
     // --- WebSocket (live) ---
     function connectWebSocket() {
