@@ -17,6 +17,9 @@ from contextlib import closing
 from typing import Dict, Any
 from collections import deque
 from datetime import datetime
+from typing import Dict, Any
+from typing import Dict, Any, Set, List
+
 
 # --- FastAPI / WebSocket ---
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -58,7 +61,7 @@ LAST_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 CENTRAL_STATUS = "OK"
 LAST_MESSAGES = deque(maxlen=5)     # últimos 5 mensajes
 RECENT_SESSIONS = deque(maxlen=50)  # histórico corto de inicios de sesión
-MAIN_LOOP = None 
+MAIN_LOOP = None
 # ---------------------------------------------------------------------------
 # ARGUMENTOS DE EJECUCIÓN
 # ---------------------------------------------------------------------------
@@ -143,7 +146,7 @@ def revoke_secret_key(cp_id: str):
 
         con.commit()
 def revoke_cp_keys_everywhere(cp_id: str):
-    revoke_secret_key(cp_id)      
+    revoke_secret_key(cp_id)
 
     CP_SECRET_KEYS.pop(cp_id, None)
     AUTHENTICATED_CPS.discard(cp_id)
@@ -215,8 +218,8 @@ def is_suministrando_cp(cp_id: str) -> bool:
         cur = con.cursor()
         row = cur.execute("SELECT status FROM charging_points WHERE id=?", (cp_id,)).fetchone()
     if row is None:
-        return False  
-    status = row[0] 
+        return False
+    status = row[0]
     return status.upper() == "SUMINISTRANDO"
 
 def update_cp(cp_id: str, status: str):
@@ -483,11 +486,11 @@ def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
 def log_central_msg(msg_type: str, detail: dict):
-    item = {"ts": now_iso(), "msg_type": msg_type, "detail": detail}  
+    item = {"ts": now_iso(), "msg_type": msg_type, "detail": detail}
     LAST_MESSAGES.append(item)
     loop = MAIN_LOOP or asyncio.get_running_loop()
     asyncio.run_coroutine_threadsafe(
-        notify_panel({"type": "central.msg", **item}), 
+        notify_panel({"type": "central.msg", **item}),
         loop
     )
 
@@ -497,6 +500,81 @@ async def notify_central_state():
 class Command(BaseModel):
     action: str           # "STOP" | "RESUME"
     cp_id: str = "ALL"    # puedes enviar "ALL" o un ID concreto
+
+class WeatherUpdate(BaseModel):
+    location: str
+    temp_c: float
+    alert: bool
+
+@app.post("/weather/alert")
+async def api_weather_alert(u: WeatherUpdate):
+    location = (u.location or "").strip()
+    if not location:
+        raise HTTPException(status_code=400, detail="location vacío")
+
+    loc_key = norm_loc(location)
+
+    WEATHER_STATE[loc_key] = {
+        "location": location,
+        "temp_c": float(u.temp_c),
+        "alert": bool(u.alert),
+        "ts": now_iso()
+    }
+
+    # Avisar al panel
+    await notify_panel({"type": "weather.update", **WEATHER_STATE[loc_key]})
+    log_central_msg("WEATHER_UPDATE", WEATHER_STATE[loc_key])
+
+    # Buscar CPs en esa localización
+    cps = list_cps()
+    cp_ids = [cp["id"] for cp in cps if norm_loc(cp.get("location")) == loc_key]
+
+    if not cp_ids:
+        return {"ok": True, "note": f"No hay CPs con location={location}", "state": WEATHER_STATE[loc_key]}
+
+    # ALERTA ON: parar CPs (pero si hay sesión, parar al terminar)
+    if u.alert:
+        for cp_id in cp_ids:
+            WEATHER_DISABLED_CPS.add(cp_id)
+
+            if cp_id in ACTIVE_SESSIONS:
+                # está cargando → NO cortamos
+                WEATHER_PENDING_STOP.add(cp_id)
+                await notify_panel({"type": "weather.stop_pending", "cp_id": cp_id, "location": location})
+                log_central_msg("WEATHER_STOP_PENDING", {"cp_id": cp_id, "location": location})
+            else:
+                # no está cargando → STOP inmediato
+                await send_cp_command("STOP", cp_id, source="weather.alert_on")
+                update_cp(cp_id, "PARADO")
+                await notify_panel({"type": "status", "cp_id": cp_id, "status": "PARADO"})
+                log_central_msg("WEATHER_STOP", {"cp_id": cp_id, "location": location})
+
+    # ALERTA OFF: reanudar los CPs parados por clima / cancelar pendientes
+    else:
+        for cp_id in cp_ids:
+            WEATHER_PENDING_STOP.discard(cp_id)
+
+            if cp_id in WEATHER_DISABLED_CPS:
+                WEATHER_DISABLED_CPS.discard(cp_id)
+                await send_cp_command("RESUME", cp_id, source="weather.alert_off")
+                log_central_msg("WEATHER_RESUME", {"cp_id": cp_id, "location": location})
+
+    return {
+        "ok": True,
+        "state": WEATHER_STATE[loc_key],
+        "affected_cps": cp_ids,
+        "disabled_cps": sorted(WEATHER_DISABLED_CPS),
+        "pending_stop": sorted(WEATHER_PENDING_STOP),
+    }
+
+@app.get("/weather/state")
+def api_weather_state():
+    return {
+        "by_location": WEATHER_STATE,
+        "disabled_cps": sorted(WEATHER_DISABLED_CPS),
+        "pending_stop": sorted(WEATHER_PENDING_STOP),
+    }
+
 
 @app.post("/command")
 async def send_command(cmd: Command):
@@ -563,7 +641,7 @@ def monitor_socket_server(loop):
 
             action = (msg.get("action") or "").upper()
             cp_id  = msg.get("cp_id")
-            
+
             came_secure = False
 
             # Si llega cifrado, lo desciframos y reemplazamos msg/action/cp_id
@@ -584,7 +662,7 @@ def monitor_socket_server(loop):
                 # 1) El CP debe existir en BD (si no, no está dado de alta)
                 cp_row = get_cp_from_db(cp_id)
                 if not cp_row:
-                    try: 
+                    try:
                         conn.sendall(b"DENIED:NOT_REGISTERED")
                         insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "AUTH_FAIL", "CP no registrado en CENTRAL por falta de alta previa")
                         log_central_msg("AUTH_FAIL", {"cp_id": cp_id, "reason": "NOT_REGISTERED"})
@@ -593,7 +671,7 @@ def monitor_socket_server(loop):
 
                 # 2) Validar credencial contra Registry
                 if not verify_registry_credential(cp_id, credential):
-                    try: 
+                    try:
                         conn.sendall(b"DENIED:BAD_CREDENTIAL")
                         insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "AUTH_FAIL", "CP no registrado en CENTRAL por credencial inválida")
                         log_central_msg("AUTH_FAIL", {"cp_id": cp_id, "reason": "BAD_CREDENTIAL"})
@@ -625,7 +703,7 @@ def monitor_socket_server(loop):
                 insert_cp(cp_id, location, price)
                 cp_data = get_cp_from_db(cp_id)
                 print(f"CP registrado desde monitor: {cp_id} ({location}, {price} €/kWh)")
-                try: 
+                try:
                     if came_secure:
                         resp_msg = {"ok": True, "action": "REGISTER_ACK"}
                         conn.sendall(json.dumps(encrypt_secure_envelope(cp_id, resp_msg)).encode("utf-8"))
@@ -640,12 +718,12 @@ def monitor_socket_server(loop):
 
             elif action == "HEARTBEAT":
                 if not came_secure:
-                    try: 
+                    try:
                         conn.sendall(b"DENIED:REQUIRE_SECURE")
                     except: pass
                     return
                 if cp_id not in AUTHENTICATED_CPS:
-                    try: 
+                    try:
                         conn.sendall(b"DENIED:NOT_AUTH")
                         insert_audit_log(msg.get("ip") or "unknown", "CP_M_"+cp_id, "HEARTBEAT_FAIL", "CP no autenticado intentando enviar heartbeat")
                     except: pass
@@ -669,7 +747,7 @@ def monitor_socket_server(loop):
                     row = get_cp_from_db(cp_id)
 
                     insert_audit_log(msg.get("ip") or row.get("ip") or "unknown", "CP_M_"+cp_id, "FORCE_STOP", "CP en AVERIA mientras suministraba, forzando STOP")
-                    log_central_msg("FORCE_STOP", {"cp_id": cp_id, "reason": "CP en AVERIA mientras suministraba, forzando STOP"}) 
+                    log_central_msg("FORCE_STOP", {"cp_id": cp_id, "reason": "CP en AVERIA mientras suministraba, forzando STOP"})
                     asyncio.run_coroutine_threadsafe(
                         kafka_producer.send_and_wait(
                             "central.command",
@@ -696,7 +774,7 @@ def monitor_socket_server(loop):
                         pass
                     LAST_STATUS_SEEN[cp_id] = prev_status
                     return
-                
+
                  # Evitar pasar a ACTIVADO si ya está suministrando
                 if not (new_status == "ACTIVADO" and is_suministrando_cp(cp_id)):
                     # --- LOG de transición (una sola vez por cambio) ---
@@ -726,7 +804,7 @@ def monitor_socket_server(loop):
                         resp_msg = {
                             "ok": True,
                             "action": "HEARTBEAT_ACK",
-                            "health": health 
+                            "health": health
                             }
                         conn.sendall(json.dumps(encrypt_secure_envelope(cp_id, resp_msg)).encode("utf-8"))
                 except Exception:
@@ -786,6 +864,24 @@ kafka_producer = None
 # cp_id -> {"driver_id":..., "request_id":..., "session_id":...}
 ACTIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
+# ---------------------------------------------------------------------------
+# WEATHER (EV_W → CENTRAL)
+# ---------------------------------------------------------------------------
+
+def norm_loc(s: str) -> str:
+    return (s or "").strip().casefold()
+
+# key = location normalizada
+WEATHER_STATE: Dict[str, Dict[str, Any]] = {}   # loc_key -> {"location","temp_c","alert","ts"}
+
+# CPs que hemos parado por clima (para luego reanudarlos)
+WEATHER_DISABLED_CPS: Set[str] = set()
+
+# CPs que estaban cargando cuando llegó la alerta:
+# NO los paramos en ese momento; los paramos justo al terminar sesión
+WEATHER_PENDING_STOP: Set[str] = set()
+
+
 async def force_close_session(cp_id: str, reason_code: str):
     """
     Cierra en CENTRAL la sesión activa del cp_id (si existe), usando la última
@@ -843,6 +939,33 @@ async def force_close_session(cp_id: str, reason_code: str):
         "amount_eur": eur_final,
         "reason": reason_code
     })
+
+async def wait_kafka_ready(timeout_sec: float = 3.0) -> bool:
+    start = time.monotonic()
+    while kafka_producer is None:
+        if time.monotonic() - start > timeout_sec:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+async def send_cp_command(action: str, cp_id: str, source: str = "weather") -> bool:
+    if not await wait_kafka_ready():
+        # Para background: log y ya
+        log_central_msg("KAFKA_NOT_READY", {"where": "send_cp_command", "cp_id": cp_id, "action": action})
+        return False
+
+    payload = {"action": action.upper(), "cp_id": cp_id}
+    try:
+        await kafka_producer.send_and_wait("central.command", json.dumps(payload).encode())
+    except Exception as e:
+        log_central_msg("KAFKA_SEND_ERROR", {"cp_id": cp_id, "action": action, "err": str(e)})
+        return False
+
+    await notify_panel({"type": "command.sent", "ts": now_iso(), "source": source, **payload})
+    log_central_msg("COMMAND_SENT", {"source": source, **payload})
+    return True
+
+
 
 async def consume_kafka():
     global kafka_consumer
@@ -1022,8 +1145,50 @@ async def consume_kafka():
 
                 # Si fue STOP/ABORTED, PARADO; si no, ACTIVADO
                 new_status = "PARADO" if reason == "ABORTED" else "ACTIVADO"
+
+                # Si hay alerta en la location del CP → queda PARADO sí o sí
+                row = get_cp_from_db(cp_id) or {}
+                loc_key = norm_loc(row.get("location"))
+                if WEATHER_STATE.get(loc_key, {}).get("alert"):
+                    new_status = "PARADO"
+                    WEATHER_DISABLED_CPS.add(cp_id)
+
                 update_cp(cp_id, new_status)
                 await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
+
+                # Si estaba pendiente de parar por clima y sigue habiendo alerta → ahora sí mandamos STOP
+                if cp_id in WEATHER_PENDING_STOP:
+                    if WEATHER_STATE.get(loc_key, {}).get("alert"):
+                        WEATHER_PENDING_STOP.discard(cp_id)
+
+                        ok = await send_cp_command("STOP", cp_id, source="weather.after_session")
+                        if not ok:
+                            # Reintentar más tarde
+                            WEATHER_PENDING_STOP.add(cp_id)
+
+                            await notify_panel({
+                                "type": "weather.command_failed",
+                                "ts": now_iso(),
+                                "cp_id": cp_id,
+                                "action": "STOP",
+                                "source": "weather.after_session"
+                            })
+
+                            log_central_msg("WEATHER_COMMAND_FAILED", {
+                                "cp_id": cp_id,
+                                "action": "STOP",
+                                "source": "weather.after_session"
+                            })
+                        else:
+                            log_central_msg("WEATHER_STOP_AFTER_SESSION", {
+                                "cp_id": cp_id,
+                                "location": row.get("location")
+                            })
+                    else:
+                        # Se canceló la alerta antes de terminar
+                        WEATHER_PENDING_STOP.discard(cp_id)
+
+
 
                 if sess:
                     # Datos finales de la sesión
@@ -1074,10 +1239,10 @@ async def consume_kafka():
 
                     log_central_msg("SUMINISTRO_FINALIZADO", {
                         "cp_id": cp_id, "reason": reason,
-                        "driver_id": sess["driver_id"], 
+                        "driver_id": sess["driver_id"],
                         "kwh": kwh_final, "amount_eur": amount_final})
-                    
-                    row = get_cp_from_db(cp_id)
+
+                    row = get_cp_from_db(cp_id) or {}
                     insert_audit_log(row.get("ip") or "unknown", "CP_E_"+cp_id, "SESSION_ENDED", f"Sesión {sess['session_id']} finalizada, kwh: {kwh_final}, eur: {amount_final}, reason: {reason}")
                     # borra del panel de sesiones iniciadas
                     await notify_panel({
@@ -1118,7 +1283,7 @@ async def consume_kafka():
                     log_central_msg("INICIO_MANUAL_DENEGADO", {"cp_id": acc_cp, "driver_id": acc_drv, "reason": f"status={row['status']}"})
                     continue
 
-                # Crear sesión y autorizar 
+                # Crear sesión y autorizar
                 price = row["price_eur_kwh"]
                 session_id = start_session(acc_cp, acc_drv, price)
                 ACTIVE_SESSIONS[acc_cp] = {"driver_id": acc_drv, "request_id": acc_req, "session_id": session_id}
@@ -1140,7 +1305,7 @@ async def consume_kafka():
                 log_central_msg("SUMINISTRO_MANUAL_INICIADO", {"cp_id": acc_cp, "driver_id": acc_drv, "session_id": session_id})
 
                 row = get_cp_from_db(acc_cp)
-                insert_audit_log(row.get("ip") or "unknown", "CP_E_"+acc_cp, "MANUAL_SESSION_STARTED", f"Sesión manual {session_id} iniciada en CP {acc_cp} para driver {acc_drv}")    
+                insert_audit_log(row.get("ip") or "unknown", "CP_E_"+acc_cp, "MANUAL_SESSION_STARTED", f"Sesión manual {session_id} iniciada en CP {acc_cp} para driver {acc_drv}")
             elif topic == "engine.reject":
                 rej_cp   = data.get("cp_id")
                 rej_drv  = data.get("driver_id")

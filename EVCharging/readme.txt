@@ -4,7 +4,7 @@ instalacion:
 pip install fastapi uvicorn aiokafka pydantic websockets
 
 #BASEDATA
-En la carpetanEVCentral hacer desde una terminal 
+En la carpetanEVCentral hacer desde una terminal
 mi pc:
 cd /d D:\sd1\ds1\ds1\EVCharging\EV_Central
 sqlite3 evcentral.db < schema.sql
@@ -13,6 +13,10 @@ python init_db.py
 
 cd %KAFKA_HOME%
 %KAFKA_HOME%\bin\windows\kafka-server-start.bat .\config\server.properties
+
+#Si falla lanzar el kafka, probar esto:
+attrib -R -S -H "C:\Kafka\logs\__cluster_metadata-0\*.deleted"
+del /F /Q "C:\Kafka\logs\__cluster_metadata-0\*.deleted"
 
 Despliegue:
 #EV_Central:
