@@ -514,6 +514,10 @@ async def api_weather_alert(u: WeatherUpdate):
 
     loc_key = norm_loc(location)
 
+    prev = WEATHER_STATE.get(loc_key)
+    prev_alert = None if prev is None else bool(prev.get("alert"))
+
+    # Actualiza siempre el estado
     WEATHER_STATE[loc_key] = {
         "location": location,
         "temp_c": float(u.temp_c),
@@ -524,6 +528,51 @@ async def api_weather_alert(u: WeatherUpdate):
     # Avisar al panel
     await notify_panel({"type": "weather.update", **WEATHER_STATE[loc_key]})
     log_central_msg("WEATHER_UPDATE", WEATHER_STATE[loc_key])
+
+    # Buscar CPs en esa localización
+    cps = list_cps()
+    cp_ids = [cp["id"] for cp in cps if norm_loc(cp.get("location")) == loc_key]
+
+    if not cp_ids:
+        return {"ok": True, "note": f"No hay CPs con location={location}", "state": WEATHER_STATE[loc_key]}
+
+    if u.alert:
+        for cp_id in cp_ids:
+            # marcar como “afectado por clima”
+            WEATHER_DISABLED_CPS.add(cp_id)
+
+            if cp_id in ACTIVE_SESSIONS:
+                WEATHER_PENDING_STOP.add(cp_id)
+                await notify_panel({"type": "weather.stop_pending", "cp_id": cp_id, "location": location})
+                log_central_msg("WEATHER_STOP_PENDING", {"cp_id": cp_id, "location": location})
+            else:
+                # STOP idempotente: solo si no está ya PARADO
+                row = get_cp_from_db(cp_id) or {}
+                cur_status = (row.get("status") or "").upper()
+                if cur_status != "PARADO":
+                    await send_cp_command("STOP", cp_id, source="weather.alert_on")
+                    update_cp(cp_id, "PARADO")
+                    await notify_panel({"type": "status", "cp_id": cp_id, "status": "PARADO"})
+                    log_central_msg("WEATHER_STOP", {"cp_id": cp_id, "location": location})
+
+    else:
+        for cp_id in cp_ids:
+            WEATHER_PENDING_STOP.discard(cp_id)
+
+            if cp_id in WEATHER_DISABLED_CPS:
+                WEATHER_DISABLED_CPS.discard(cp_id)
+
+                # manda RESUME al engine
+                await send_cp_command("RESUME", cp_id, source="weather.alert_off")
+                log_central_msg("WEATHER_RESUME", {"cp_id": cp_id, "location": location})
+
+                # IMPORTANTÍSIMO: si estaba PARADO por clima, súbelo a ACTIVADO
+                row = get_cp_from_db(cp_id) or {}
+                if (row.get("status") or "").upper() == "PARADO":
+                    update_cp(cp_id, "ACTIVADO")
+                    await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
+
+
 
     # Buscar CPs en esa localización
     cps = list_cps()
@@ -566,6 +615,14 @@ async def api_weather_alert(u: WeatherUpdate):
         "disabled_cps": sorted(WEATHER_DISABLED_CPS),
         "pending_stop": sorted(WEATHER_PENDING_STOP),
     }
+
+def update_cp_location_in_db(cp_id: str, location: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE charging_points SET location=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (location, cp_id))
+    conn.commit()
+    conn.close()
+
 
 @app.get("/weather/state")
 def api_weather_state():
@@ -716,6 +773,26 @@ def monitor_socket_server(loop):
                 )
                 log_central_msg("REGISTRO_CP", {"cp_id": cp_id, "location": location, "price": price})
 
+            elif action == "UPDATE_LOCATION":
+                cp_id = msg["cp_id"]
+                new_loc = (msg.get("location") or "").strip()
+                if not new_loc:
+                    return {"ok": False, "error": "EMPTY_LOCATION"}
+
+                # 1) update en SQLite
+                update_cp_location_in_db(cp_id, new_loc)
+                resp_msg = {"ok": True, "cp_id": cp_id, "location": new_loc}
+
+                try:
+                    if came_secure:
+                        conn.sendall(json.dumps(encrypt_secure_envelope(cp_id, resp_msg)).encode("utf-8"))
+                    else:
+                        conn.sendall(json.dumps(resp_msg).encode("utf-8"))
+                except Exception:
+                    pass
+                return
+
+
             elif action == "HEARTBEAT":
                 if not came_secure:
                     try:
@@ -775,7 +852,7 @@ def monitor_socket_server(loop):
                     LAST_STATUS_SEEN[cp_id] = prev_status
                     return
 
-                 # Evitar pasar a ACTIVADO si ya está suministrando
+                # Evitar pasar a ACTIVADO si ya está suministrando
                 if not (new_status == "ACTIVADO" and is_suministrando_cp(cp_id)):
                     # --- LOG de transición (una sola vez por cambio) ---
                     if prev_status != new_status:

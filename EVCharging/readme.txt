@@ -67,3 +67,9 @@ D:\sd1\ds1\ds1\EVCharging\EV_Driver\destinos.txt
  $body = @{location="Parking A"; temp_c=5; alert=$false} | ConvertTo-Json
  Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8080/weather/alert" -ContentType "application/json" -Body $body
  Invoke-RestMethod -Uri "http://127.0.0.1:8080/weather/state"
+
+
+# Como lanzar el weather:
+python EV_W.py http://127.0.0.1:8080 da93b07bb938a99ddf87e856393e53ce
+# Para arrancarlo ya con ciudades
+python EV_W.py http://127.0.0.1:8080 da93b07bb938a99ddf87e856393e53ce cities.txt

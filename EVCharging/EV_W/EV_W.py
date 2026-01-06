@@ -35,16 +35,51 @@ def load_cities(path: str) -> Set[str]:
             out.add(t)
     return out
 
-async def fetch_temp_c(client: httpx.AsyncClient, api_key: str, city: str) -> float:
-    # Current weather data :contentReference[oaicite:5]{index=5}
+async def geocode_latlon(
+    client: httpx.AsyncClient,
+    api_key: str,
+    city_query: str,
+    cache: Dict[str, tuple[float, float]]
+) -> tuple[float, float]:
+    """
+    city_query: "Alicante,ES" recomendado. También vale "Madrid" (pero puede ser ambiguo).
+    cache: para no pedir geocoding cada ciclo.
+    """
+    key = city_query.strip()
+    if key in cache:
+        return cache[key]
+
     r = await client.get(
-        "https://api.openweathermap.org/data/2.5/weather",
-        params={"q": city, "appid": api_key, "units": "metric"},
+        "https://api.openweathermap.org/geo/1.0/direct",
+        params={"q": key, "limit": 1, "appid": api_key},
         timeout=10.0
     )
     r.raise_for_status()
     data = r.json()
-    # temp en main.temp
+    if not data:
+        raise ValueError(f"No se encontró geocoding para: {city_query}")
+
+    lat = float(data[0]["lat"])
+    lon = float(data[0]["lon"])
+    cache[key] = (lat, lon)
+    return lat, lon
+
+
+async def fetch_temp_c(
+    client: httpx.AsyncClient,
+    api_key: str,
+    city_query: str,
+    geo_cache: Dict[str, tuple[float, float]]
+) -> float:
+    lat, lon = await geocode_latlon(client, api_key, city_query, geo_cache)
+
+    r = await client.get(
+        "https://api.openweathermap.org/data/2.5/weather",
+        params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric"},
+        timeout=10.0
+    )
+    r.raise_for_status()
+    data = r.json()
     return float(data["main"]["temp"])
 
 async def notify_central(client: httpx.AsyncClient, central_base: str, city: str, temp_c: float, alert: bool):
@@ -60,6 +95,7 @@ async def notify_central(client: httpx.AsyncClient, central_base: str, city: str
 
 async def poll_loop(central_base: str, api_key: str, cities: Set[str], states: Dict[str, LocState], stop_evt: asyncio.Event):
     async with httpx.AsyncClient() as client:
+        geo_cache: Dict[str, tuple[float, float]] = {}
         while not stop_evt.is_set():
             # snapshot para que el menú pueda modificar cities sin romper iteración
             snapshot = list(cities)
@@ -69,7 +105,7 @@ async def poll_loop(central_base: str, api_key: str, cities: Set[str], states: D
 
             for city in snapshot:
                 try:
-                    temp_c = await fetch_temp_c(client, api_key, city)
+                    temp_c = await fetch_temp_c(client, api_key, city, geo_cache)
                 except Exception as e:
                     print(f"⚠️ OpenWeather fail city={city}: {e}")
                     continue
@@ -77,19 +113,20 @@ async def poll_loop(central_base: str, api_key: str, cities: Set[str], states: D
                 st = states.setdefault(city, LocState())
                 new_alert = temp_c < THRESHOLD_C
 
-                # Notificar SOLO si cambia el estado de alerta
-                if new_alert != st.alert:
-                    st.alert = new_alert
-                    st.temp_c = temp_c
-                    await notify_central(client, central_base, city, temp_c, new_alert)
-                    print(f"[ALERTA] city={city} temp={temp_c:.2f}C alert={new_alert}")
+                transition = (st.temp_c is None) or (new_alert != st.alert)
+
+                # actualiza estado local
+                st.temp_c = temp_c
+                st.alert = new_alert
+
+                # NOTIFICAR SIEMPRE (para actualizar temperatura en Central/front)
+                await notify_central(client, central_base, city, temp_c, new_alert)
+
+                # logs bonitos
+                if transition:
+                    print(f"[ALERTA-TRANSICION] city={city} temp={temp_c:.2f}C alert={new_alert}")
                 else:
-                    # Actualiza temp (para front), sin spamear: solo si cambia bastante
-                    if st.temp_c is None or abs(temp_c - st.temp_c) >= 0.5:
-                        st.temp_c = temp_c
-                        # opcional: Central podría tener /weather/temp para actualizar sin alerta
-                        # aquí lo dejamos sin POST para no cargar.
-                    print(f"[OK] city={city} temp={temp_c:.2f}C alert={st.alert}")
+                    print(f"[OK] city={city} temp={temp_c:.2f}C alert={new_alert}")
 
             await asyncio.sleep(POLL_SEC)
 
@@ -105,31 +142,39 @@ def print_menu():
 async def menu_loop(cities: Set[str], states: Dict[str, LocState], stop_evt: asyncio.Event):
     print_menu()
     while True:
-        cmd = input("EV_W> ").strip().lower()
+        cmd = (await asyncio.to_thread(input, "EV_W> ")).strip().lower()
+
         if cmd == "1":
             print("Ciudades:", sorted(cities) if cities else "(vacío)")
+
         elif cmd == "2":
-            c = input("Ciudad a añadir: ").strip()
+            c = (await asyncio.to_thread(input, "Ciudad a añadir: ")).strip()
             if c:
                 cities.add(c)
                 print("OK añadido:", c)
+
         elif cmd == "3":
-            c = input("Ciudad a eliminar: ").strip()
+            c = (await asyncio.to_thread(input, "Ciudad a eliminar: ")).strip()
             if c in cities:
                 cities.remove(c)
                 print("OK eliminado:", c)
             else:
                 print("No existe en lista.")
+
         elif cmd == "4":
             for c in sorted(cities):
                 st = states.get(c) or LocState()
                 print(f"- {c}: temp={st.temp_c} alert={st.alert}")
+
         elif cmd == "q":
             stop_evt.set()
             return
+
         else:
             print("Comando no válido.")
+
         print_menu()
+
 
 async def main():
     if len(sys.argv) < 3:
@@ -144,7 +189,7 @@ async def main():
     states: Dict[str, LocState] = {}
     stop_evt = asyncio.Event()
 
-    # Requisito: poder cambiar localizaciones “a voluntad” sin reiniciar 
+    # Requisito: poder cambiar localizaciones “a voluntad” sin reiniciar
     poll_task = asyncio.create_task(poll_loop(central_base, api_key, cities, states, stop_evt))
     try:
         await menu_loop(cities, states, stop_evt)

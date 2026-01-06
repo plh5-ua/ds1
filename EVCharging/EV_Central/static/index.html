@@ -20,6 +20,9 @@
     button.resume { background: #28a745; color: white; }
     button.global { margin: 5px; padding: 8px 12px; }
     button.revoke { background: #dc3545; color: white; } /* rojo */
+    .ALERTA { background: #dc3545; }  /* rojo */
+    .OKW { background: #28a745; }     /* verde */
+
 
   </style>
 </head>
@@ -63,6 +66,25 @@
     <tbody></tbody>
   </table>
 
+  <h2>🌦️ Weather (EV_W)</h2>
+
+    <table id="weatherTable">
+      <thead>
+        <tr>
+          <th>Ubicación</th>
+          <th>Temp (°C)</th>
+          <th>Alerta</th>
+          <th>Última actualización</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <div id="weatherAffect" style="margin-top: 8px; font-weight: bold;">
+      CPs deshabilitados por clima: <span id="weatherDisabled">—</span><br>
+      CPs con stop pendiente: <span id="weatherPending">—</span>
+    </div>
+
   <h2>Últimos 5 mensajes</h2>
   <table id="messagesTable">
     <thead>
@@ -85,6 +107,10 @@
     const sessionsBody = document.querySelector("#sessionsTable tbody");
     const messagesBody = document.querySelector("#messagesTable tbody");
     const centralStateValue = document.getElementById("centralStateValue");
+    const weatherBody = document.querySelector("#weatherTable tbody");
+    const weatherDisabled = document.getElementById("weatherDisabled");
+    const weatherPending = document.getElementById("weatherPending");
+
 
     // --- Helpers CPs ---
     function normalize(cp) {
@@ -210,6 +236,69 @@
       }
     }
 
+    function rowIdForWeather(key) { return `w-${key}`; }
+
+    function upsertWeatherRow(key, w) {
+      const rid = rowIdForWeather(key);
+      let tr = document.getElementById(rid);
+      const alert = !!w.alert;
+      const badgeClass = alert ? "ALERTA" : "OKW";
+      const badgeText = alert ? "ALERTA (<0°C)" : "OK (>=0°C)";
+
+      if (!tr) {
+        tr = document.createElement("tr");
+        tr.id = rid;
+        tr.innerHTML = `
+          <td>${w.location ?? key}</td>
+          <td>${(w.temp_c ?? "—")}</td>
+          <td class="estado ${badgeClass}">${badgeText}</td>
+          <td>${w.ts ?? "—"}</td>
+        `;
+        weatherBody.appendChild(tr);
+        return;
+      }
+
+      tr.children[0].textContent = w.location ?? tr.children[0].textContent;
+      tr.children[1].textContent = (w.temp_c ?? "—");
+      tr.children[2].textContent = badgeText;
+      tr.children[2].className = "estado " + badgeClass;
+      tr.children[3].textContent = w.ts ?? tr.children[3].textContent;
+    }
+
+    function renderWeatherState(state) {
+      weatherBody.innerHTML = "";
+
+      const byLoc = state.by_location || {};
+      const now = Date.now();
+      const MAX_AGE_MS = 10000; // 10s de tiempo de vida maximo sin recibir actualizaciones
+
+      Object.entries(byLoc).forEach(([key, w]) => {
+        const ts = w.ts ? Date.parse(w.ts) : NaN;
+        const ageOk = Number.isFinite(ts) ? (now - ts) <= MAX_AGE_MS : true;
+        if (ageOk) upsertWeatherRow(key, w);
+      });
+
+
+      weatherDisabled.textContent = (state.disabled_cps && state.disabled_cps.length)
+        ? state.disabled_cps.join(", ")
+        : "—";
+
+      weatherPending.textContent = (state.pending_stop && state.pending_stop.length)
+        ? state.pending_stop.join(", ")
+        : "—";
+    }
+
+    async function loadWeatherState() {
+      try {
+        const res = await fetch("/weather/state");
+        const data = await res.json();
+        renderWeatherState(data);
+      } catch (e) {
+        console.warn("No se pudo cargar /weather/state:", e);
+      }
+    }
+
+
     // --- Mensajes buffer ---
     function prependMessageRow(m) {
       const ts = m.ts || new Date().toLocaleString();
@@ -253,7 +342,9 @@
 
     // --- WebSocket (live) ---
     function connectWebSocket() {
-      const ws = new WebSocket(`ws://${window.location.host}/ws`);
+      const wsProto = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${wsProto}://${window.location.host}/ws`);
+
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
 
@@ -274,6 +365,19 @@
           return;
         }
 
+        // Weather
+        if (msg.type === "weather.update") {
+          // msg trae {location,temp_c,alert,ts,...}
+          // Ojo: no trae el key, así que refrescamos el estado completo:
+          loadWeatherState();
+          return;
+        }
+
+        if (msg.type === "weather.stop_pending" || msg.type === "weather.command_failed") {
+          loadWeatherState();
+          return;
+        }
+
         // Sesión empieza (la añadimos a la tabla de activos)
         if (msg.type === "session.started") { addRunningSession(msg); return; }
 
@@ -291,11 +395,13 @@
     loadActiveSessions();   // ← inicial desde BD
     loadCentralSummary();   // ← estado y últimos mensajes
     connectWebSocket();
-    
+    loadWeatherState();
+
     setInterval(() => {
-    loadCPs();           
-    loadActiveSessions(); 
-    // loadCentralSummary(); para refrescar ultimos mensajes 
+    loadCPs();
+    loadActiveSessions();
+    loadWeatherState();
+    // loadCentralSummary(); para refrescar ultimos mensajes
   }, 1000);
   </script>
 </body>

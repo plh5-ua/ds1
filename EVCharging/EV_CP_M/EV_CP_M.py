@@ -166,9 +166,9 @@ def send_to_central_and_recv(message, timeout=3) -> dict | str:
 # -------------------------------------------------------------
 # REGISTRY (REST)
 # -------------------------------------------------------------
-def registry_alta():
+def registry_alta(location: str):
     url = f"{REGISTRY_BASE}/cp/{CP_ID}"
-    payload = {"cp_id": CP_ID, "location": LOCATION, "price": PRICE, "ip": ENGINE_IP}
+    payload = {"cp_id": CP_ID, "location": location, "price": PRICE, "ip": ENGINE_IP}
     r = requests.put(url, json=payload, verify=REGISTRY_VERIFY, timeout=5)
     if r.status_code != 200:
         raise RuntimeError(f"ALTA falló: {r.status_code} {r.text}")
@@ -282,11 +282,14 @@ def print_menu():
     print("2) Dar de baja (Registry REST)")
     print("3) Autenticar (Central SOCKET)")
     print("4) Parar Heartbeats")
+    print("5) Cambiar ubicación (UPDATE en Central)")
     print("0) Salir")
     print("===========================\n")
 
 async def main():
     print(f"🩺 EV_CP_M {CP_ID} | Engine:{ENGINE_ADDR} | Central:{CENTRAL_ADDR} | Registry:{REGISTRY_ADDR}")
+
+    current_location = LOCATION
 
     while True:
         print_menu()
@@ -300,7 +303,7 @@ async def main():
 
         elif op == "1":
             try:
-                registry_alta()
+                registry_alta(current_location)
             except Exception as e:
                 print("Error:", e)
 
@@ -315,7 +318,7 @@ async def main():
             try:
                 cred = load_credential()
                 resp = send_to_central_and_recv(
-                    {"action": "AUTH", "cp_id": CP_ID, "credential": cred, "ip": ENGINE_IP, "location": LOCATION, "price": PRICE},
+                    {"action": "AUTH", "cp_id": CP_ID, "credential": cred, "ip": ENGINE_IP, "location": current_location, "price": PRICE},
                     timeout=3
                 )
                 if resp.startswith("DENIED"):
@@ -340,6 +343,36 @@ async def main():
 
         elif op == "4":
             await stop_heartbeats()
+
+        elif op == "5":
+          try:
+              if not is_authenticated_local():
+                  print("No autenticado. Primero opción 3 (Autenticar).")
+                  continue
+
+              new_loc = (await asyncio.to_thread(input, "Nueva ubicación (ej: Oslo,NO): ")).strip()
+              if not new_loc:
+                  print("Ubicación vacía, cancelado.")
+                  continue
+
+              # Actualiza variable local para que a partir de ahora uses la nueva location en alta/auth/etc.
+              current_location = new_loc.replace("_", " ")
+
+              # Pídeselo a Central (irá cifrado automáticamente porque action != AUTH)
+              resp = send_to_central_and_recv(
+                  {"action": "UPDATE_LOCATION", "cp_id": CP_ID, "location": current_location},
+                  timeout=3
+              )
+
+              print("Central response:", resp)
+
+              # (Opcional) si quieres que Engine también “se entere” (no es necesario para weather),
+              # puedes reenviar {"cp_id", "location"} al engine:
+              # send_id_to_engine()
+
+          except Exception as e:
+              print("Error:", e)
+
 
         else:
             print("Opción no válida.")
