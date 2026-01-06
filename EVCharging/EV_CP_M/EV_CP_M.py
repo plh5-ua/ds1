@@ -360,7 +360,7 @@ async def main():
 
               # Pídeselo a Central (irá cifrado automáticamente porque action != AUTH)
               resp = send_to_central_and_recv(
-                  {"action": "UPDATE_LOCATION", "cp_id": CP_ID, "location": current_location},
+                  {"action": "UPDATE_LOCATION", "cp_id": CP_ID, "location": current_location , "ip": ENGINE_IP},
                   timeout=3
               )
 

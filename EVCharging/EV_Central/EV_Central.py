@@ -22,7 +22,7 @@ from typing import Dict, Any, Set, List
 
 
 # --- FastAPI / WebSocket ---
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from requests import request
 import uvicorn
@@ -507,7 +507,7 @@ class WeatherUpdate(BaseModel):
     alert: bool
 
 @app.post("/weather/alert")
-async def api_weather_alert(u: WeatherUpdate):
+async def api_weather_alert(u: WeatherUpdate, request: Request):
     location = (u.location or "").strip()
     if not location:
         raise HTTPException(status_code=400, detail="location vacío")
@@ -517,17 +517,33 @@ async def api_weather_alert(u: WeatherUpdate):
     prev = WEATHER_STATE.get(loc_key)
     prev_alert = None if prev is None else bool(prev.get("alert"))
 
-    # Actualiza siempre el estado
+    new_alert = bool(u.alert)
+    temp_c = float(u.temp_c)
+
+    # Actualiza siempre el estado (último valor conocido)
     WEATHER_STATE[loc_key] = {
         "location": location,
-        "temp_c": float(u.temp_c),
-        "alert": bool(u.alert),
+        "temp_c": temp_c,
+        "alert": new_alert,
         "ts": now_iso()
     }
 
-    # Avisar al panel
+    src_ip = request.client.host if request.client else "unknown"
+
+    # Panel: sí, siempre (cada 4s)
     await notify_panel({"type": "weather.update", **WEATHER_STATE[loc_key]})
-    log_central_msg("WEATHER_UPDATE", WEATHER_STATE[loc_key])
+
+    # --- logging/auditoría: solo cuando interesa ---
+    transitioned = (prev_alert is None) or (prev_alert != new_alert)
+    if transitioned:
+        ev = "WEATHER_ALERT_ON" if new_alert else "WEATHER_ALERT_OFF"
+        log_central_msg(ev, {"location": location, "temp_c": temp_c})
+        insert_audit_log(
+            src_ip,
+            "EV_W",
+            ev,
+            json.dumps({"location": location, "temp_c": temp_c}, ensure_ascii=False)
+        )
 
     # Buscar CPs en esa localización
     cps = list_cps()
@@ -536,77 +552,58 @@ async def api_weather_alert(u: WeatherUpdate):
     if not cp_ids:
         return {"ok": True, "note": f"No hay CPs con location={location}", "state": WEATHER_STATE[loc_key]}
 
-    if u.alert:
+    # --- Aplicar efecto a CPs (idempotente) ---
+    if new_alert:
         for cp_id in cp_ids:
-            # marcar como “afectado por clima”
             WEATHER_DISABLED_CPS.add(cp_id)
 
             if cp_id in ACTIVE_SESSIONS:
-                WEATHER_PENDING_STOP.add(cp_id)
-                await notify_panel({"type": "weather.stop_pending", "cp_id": cp_id, "location": location})
-                log_central_msg("WEATHER_STOP_PENDING", {"cp_id": cp_id, "location": location})
+                # está cargando -> stop pendiente (solo si no estaba ya)
+                if cp_id not in WEATHER_PENDING_STOP:
+                    WEATHER_PENDING_STOP.add(cp_id)
+                    await notify_panel({"type": "weather.stop_pending", "cp_id": cp_id, "location": location})
+
+                    log_central_msg("WEATHER_STOP_PENDING", {"cp_id": cp_id, "location": location})
+                    insert_audit_log(
+                        src_ip, "EV_W", "WEATHER_STOP_PENDING",
+                        json.dumps({"cp_id": cp_id, "location": location}, ensure_ascii=False)
+                    )
             else:
-                # STOP idempotente: solo si no está ya PARADO
+                # STOP solo si no está ya PARADO
                 row = get_cp_from_db(cp_id) or {}
                 cur_status = (row.get("status") or "").upper()
                 if cur_status != "PARADO":
                     await send_cp_command("STOP", cp_id, source="weather.alert_on")
                     update_cp(cp_id, "PARADO")
                     await notify_panel({"type": "status", "cp_id": cp_id, "status": "PARADO"})
+
                     log_central_msg("WEATHER_STOP", {"cp_id": cp_id, "location": location})
+                    insert_audit_log(
+                        src_ip, "EV_W", "WEATHER_STOP",
+                        json.dumps({"cp_id": cp_id, "location": location}, ensure_ascii=False)
+                    )
 
     else:
         for cp_id in cp_ids:
             WEATHER_PENDING_STOP.discard(cp_id)
 
+            # Solo hacemos RESUME si estaba deshabilitado por clima
             if cp_id in WEATHER_DISABLED_CPS:
                 WEATHER_DISABLED_CPS.discard(cp_id)
 
-                # manda RESUME al engine
                 await send_cp_command("RESUME", cp_id, source="weather.alert_off")
-                log_central_msg("WEATHER_RESUME", {"cp_id": cp_id, "location": location})
 
-                # IMPORTANTÍSIMO: si estaba PARADO por clima, súbelo a ACTIVADO
+                log_central_msg("WEATHER_RESUME", {"cp_id": cp_id, "location": location})
+                insert_audit_log(
+                    src_ip, "EV_W", "WEATHER_RESUME",
+                    json.dumps({"cp_id": cp_id, "location": location}, ensure_ascii=False)
+                )
+
+                # Si estaba PARADO, lo subimos a ACTIVADO
                 row = get_cp_from_db(cp_id) or {}
                 if (row.get("status") or "").upper() == "PARADO":
                     update_cp(cp_id, "ACTIVADO")
                     await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
-
-
-
-    # Buscar CPs en esa localización
-    cps = list_cps()
-    cp_ids = [cp["id"] for cp in cps if norm_loc(cp.get("location")) == loc_key]
-
-    if not cp_ids:
-        return {"ok": True, "note": f"No hay CPs con location={location}", "state": WEATHER_STATE[loc_key]}
-
-    # ALERTA ON: parar CPs (pero si hay sesión, parar al terminar)
-    if u.alert:
-        for cp_id in cp_ids:
-            WEATHER_DISABLED_CPS.add(cp_id)
-
-            if cp_id in ACTIVE_SESSIONS:
-                # está cargando → NO cortamos
-                WEATHER_PENDING_STOP.add(cp_id)
-                await notify_panel({"type": "weather.stop_pending", "cp_id": cp_id, "location": location})
-                log_central_msg("WEATHER_STOP_PENDING", {"cp_id": cp_id, "location": location})
-            else:
-                # no está cargando → STOP inmediato
-                await send_cp_command("STOP", cp_id, source="weather.alert_on")
-                update_cp(cp_id, "PARADO")
-                await notify_panel({"type": "status", "cp_id": cp_id, "status": "PARADO"})
-                log_central_msg("WEATHER_STOP", {"cp_id": cp_id, "location": location})
-
-    # ALERTA OFF: reanudar los CPs parados por clima / cancelar pendientes
-    else:
-        for cp_id in cp_ids:
-            WEATHER_PENDING_STOP.discard(cp_id)
-
-            if cp_id in WEATHER_DISABLED_CPS:
-                WEATHER_DISABLED_CPS.discard(cp_id)
-                await send_cp_command("RESUME", cp_id, source="weather.alert_off")
-                log_central_msg("WEATHER_RESUME", {"cp_id": cp_id, "location": location})
 
     return {
         "ok": True,
@@ -774,14 +771,27 @@ def monitor_socket_server(loop):
                 log_central_msg("REGISTRO_CP", {"cp_id": cp_id, "location": location, "price": price})
 
             elif action == "UPDATE_LOCATION":
-                cp_id = msg["cp_id"]
+                cp_id = msg.get("cp_id")
                 new_loc = (msg.get("location") or "").strip()
-                if not new_loc:
-                    return {"ok": False, "error": "EMPTY_LOCATION"}
+                ip_src = (msg.get("ip") or (addr[0] if addr else "unknown"))
 
-                # 1) update en SQLite
-                update_cp_location_in_db(cp_id, new_loc)
-                resp_msg = {"ok": True, "cp_id": cp_id, "location": new_loc}
+                if not new_loc:
+                    resp_msg = {"ok": False, "error": "EMPTY_LOCATION"}
+                else:
+                    old = get_cp_from_db(cp_id) or {}
+                    old_loc = old.get("location")
+
+                    update_cp_location_in_db(cp_id, new_loc)
+
+                    insert_audit_log(
+                        ip_src,
+                        f"CP_M_{cp_id}",
+                        "UPDATE_LOCATION",
+                        json.dumps({"cp_id": cp_id, "old_location": old_loc, "new_location": new_loc}, ensure_ascii=False)
+                    )
+                    log_central_msg("UPDATE_LOCATION", {"cp_id": cp_id, "old_location": old_loc, "new_location": new_loc})
+
+                    resp_msg = {"ok": True, "cp_id": cp_id, "old_location": old_loc, "location": new_loc}
 
                 try:
                     if came_secure:
