@@ -1413,7 +1413,8 @@ async def main():
     asyncio.create_task(monitor_disconnections())
 
     # HTTP + WS del panel
-    config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+    # quevedo, he añadido el access_log=False para que no salga todo el rato en consola los accesos (los get)
+    config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT, log_level="info", access_log=False)
     server = uvicorn.Server(config)
     await server.serve()
 
