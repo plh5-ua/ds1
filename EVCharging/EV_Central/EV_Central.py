@@ -309,41 +309,35 @@ def derive_aes_key(secret_key_str: str) -> bytes:
     # 32 bytes -> AES-256
     return hashlib.sha256(secret_key_str.encode("utf-8")).digest()
 
-def decrypt_secure_envelope(envelope: dict) -> dict:
+def decrypt_secure_envelope(envelope: dict, topic: str | None = None) -> dict:
     cp_id = envelope.get("cp_id")
     if not cp_id:
         raise ValueError("NO_CP_ID")
 
-    # 1) comprobar que hay clave para ese CP
     secret_key_str = CP_SECRET_KEYS.get(cp_id)
     if not secret_key_str:
         raise ValueError("NO_KEY_FOR_CP")
 
-    # 2) anti-replay simple con timestamp
     ts = int(envelope.get("ts") or 0)
     now = int(time.time())
     if ts <= 0 or abs(now - ts) > 20:
         raise ValueError("STALE_OR_BAD_TS")
 
-    # 3) descifrar
-    nonce_b64 = envelope.get("nonce") or ""
-    ct_b64 = envelope.get("ciphertext") or ""
-
-    nonce = base64.b64decode(nonce_b64)
-    ct = base64.b64decode(ct_b64)
+    nonce = base64.b64decode(envelope.get("nonce") or "")
+    ct    = base64.b64decode(envelope.get("ciphertext") or "")
 
     key = derive_aes_key(secret_key_str)
     aesgcm = AESGCM(key)
 
-    uniq = f"{ts}:{envelope.get('nonce')}"
-    if seen_before(uniq):
-        raise ValueError("REPLAY_DETECTED")
-
-    # AAD: ata cp_id y ts a la autenticidad del mensaje
-    aad = f"{cp_id}|{ts}".encode("utf-8")
+    # si viene por kafka incluimos topic en AAD
+    if topic:
+        aad = f"{cp_id}|{ts}|{topic}".encode("utf-8")
+    else:
+        aad = f"{cp_id}|{ts}".encode("utf-8")
 
     pt = aesgcm.decrypt(nonce, ct, aad)
     return json.loads(pt.decode("utf-8"))
+
 def load_secret_key_from_db(cp_id: str) -> str | None:
     with closing(get_db()) as con:
         row = con.execute(
@@ -1089,6 +1083,15 @@ async def consume_kafka():
         async for msg in kafka_consumer:
             topic = msg.topic
             data = msg.value
+            
+            # desciframos si viene cifrado
+            if isinstance(data, dict) and (data.get("action") or "").upper() == "SECURE":
+                try:
+                    data = decrypt_secure_envelope(data, topic=topic)  # <- PASAMOS EL TOPIC
+                except Exception as e:
+                    log_central_msg("KAFKA_BAD_SECURE", {"topic": topic, "error": str(e)})
+                    continue
+
             cp_id = data.get("cp_id")
             location = data.get("location")
             price = data.get("kwh", 0.30)

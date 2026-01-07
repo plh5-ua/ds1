@@ -1,7 +1,8 @@
-import asyncio, json, sys, random, threading, uuid
+import asyncio, json, sys, random, threading, uuid, os, time, base64, hashlib
 from collections import deque
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from uuid import uuid4
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 
@@ -69,12 +70,47 @@ async def ask(prompt: str) -> str:
         PROMPT_FUT = None
 
 # -------------------------------------------------------------
+# CIFRADO AES-GCM
+# -------------------------------------------------------------
+def _key_file_for(cp_id: str) -> str:
+    return f"cp_{cp_id}_secretkey.json"
+
+def load_secret_key_str_for_cp(cp_id: str) -> str:
+    key_file = _key_file_for(cp_id)
+    if not os.path.exists(key_file):
+        raise RuntimeError(f"No hay secret_key para CP {cp_id}. Autentica el monitor primero (opción 3).")
+    with open(key_file, "r", encoding="utf-8") as f:
+        return json.load(f)["secret_key"]
+
+def derive_aes_key(secret_key_str: str) -> bytes:
+    return hashlib.sha256(secret_key_str.encode("utf-8")).digest()
+
+def encrypt_kafka_envelope(cp_id: str, topic: str, plain_obj: dict) -> dict:
+    secret_key_str = load_secret_key_str_for_cp(cp_id)
+    key = derive_aes_key(secret_key_str)
+    aesgcm = AESGCM(key)
+
+    nonce = os.urandom(12)
+    ts = int(time.time())
+
+    pt = json.dumps(plain_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    aad = f"{cp_id}|{ts}|{topic}".encode("utf-8")
+
+    ct = aesgcm.encrypt(nonce, pt, aad)
+
+    return {
+        "action": "SECURE",
+        "cp_id": cp_id,
+        "ts": ts,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ct).decode("ascii"),
+    }
+
+
+# -------------------------------------------------------------
 # KAFKA → CENTRAL
 # -------------------------------------------------------------
-async def register_cp(producer: AIOKafkaProducer):
-    msg = {"cp_id": CP_ID, "location": CP_LOCATION, "kwh": PRICE, "status": STATUS}
-    await producer.send_and_wait("cp.register", json.dumps(msg).encode())
-    print(f"📡 Registrando CP {CP_ID} en CENTRAL ({CP_LOCATION}) - {PRICE} €/kWh")
 
 async def send_status(producer: AIOKafkaProducer, status: str):
     """Publica el estado y, si implica no suministrar, activa STOP para cortar la carga."""
@@ -84,7 +120,8 @@ async def send_status(producer: AIOKafkaProducer, status: str):
     if status.upper() in {"PARADO", "AVERIA", "DESCONECTADO"}:
         STOP.set()
     payload = {"cp_id": CP_ID, "status": status}
-    await producer.send_and_wait("cp.status", json.dumps(payload).encode())
+    secured_payload = encrypt_kafka_envelope(CP_ID, "cp.status", payload)
+    await producer.send_and_wait("cp.status", json.dumps(secured_payload).encode())
     print(f"Estado actualizado: {status}")
 
 # -------------------------------------------------------------
@@ -116,7 +153,8 @@ async def start_charging(producer: AIOKafkaProducer):
             "kwh_total": round(kwh, 3),
             "eur_total": amount
         }
-        await producer.send_and_wait("cp.telemetry", json.dumps(telem).encode())
+        secured_telem = encrypt_kafka_envelope(CP_ID, "cp.telemetry", telem)
+        await producer.send_and_wait("cp.telemetry", json.dumps(secured_telem).encode())
         print(f"{CP_ID}: {kw} kW — {amount:.2f} €")
 
         try:
@@ -142,7 +180,8 @@ async def start_charging(producer: AIOKafkaProducer):
         "amount_eur": round(kwh * PRICE, 2),
         "reason": reason,
     }
-    await producer.send_and_wait("cp.session_ended", json.dumps(end_msg).encode())
+    secured_end_msg = encrypt_kafka_envelope(CP_ID, "cp.session_ended", end_msg)
+    await producer.send_and_wait("cp.session_ended", json.dumps(secured_end_msg).encode())
 
     final_status = "PARADO" if aborted else "ACTIVADO"
     await send_status(producer, final_status)
@@ -199,7 +238,8 @@ async def menu_loop(producer: AIOKafkaProducer):
                 else:
                     req_id = "manual-" + uuid.uuid4().hex[:8]
                     payload = {"cp_id": CP_ID, "driver_id": drv, "request_id": req_id}
-                    await producer.send_and_wait("engine.start_manual", json.dumps(payload).encode())
+                    secured_payload = encrypt_kafka_envelope(CP_ID, "engine.start_manual", payload)
+                    await producer.send_and_wait("engine.start_manual", json.dumps(secured_payload).encode())
                     print(f"Enviado engine.start_manual: cp={CP_ID} driver={drv} req={req_id}")
                     print("↪ Espera 'central.authorize' y luego usa 4) Aceptar o 5) Rechazar.")
 
@@ -225,7 +265,8 @@ async def menu_loop(producer: AIOKafkaProducer):
                     "request_id": PENDING_AUTH["request_id"],
                     "reason": reason,
                 }
-                await producer.send_and_wait("engine.reject", json.dumps(payload).encode())
+                secured_payload = encrypt_kafka_envelope(CP_ID, "engine.reject", payload)
+                await producer.send_and_wait("engine.reject", json.dumps(secured_payload).encode())
                 print(f"Rechazo enviado a CENTRAL para driver {PENDING_AUTH['driver_id']}.")
                 PENDING_AUTH = None
         elif cmd == "6":
