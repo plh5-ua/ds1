@@ -73,3 +73,12 @@ D:\sd1\ds1\ds1\EVCharging\EV_Driver\destinos.txt
 python EV_W.py http://127.0.0.1:8080 da93b07bb938a99ddf87e856393e53ce
 # Para arrancarlo ya con ciudades
 python EV_W.py http://127.0.0.1:8080 da93b07bb938a99ddf87e856393e53ce cities.txt
+
+# Scripts automáticos con la ruta del pc de pablo
+start cmd /k "python EV_CP_E.py localhost:9092 6001"
+start cmd /k "python EV_CP_E.py localhost:9092 6002"
+start cmd /k "python EV_CP_E.py localhost:9092 6003"
+
+start cmd /k "python EV_CP_M.py 127.0.0.1:6001 127.0.0.1:9000 127.0.0.1:7070 1 Oslo,NO 0.45"
+start cmd /k "python EV_CP_M.py 127.0.0.1:6002 127.0.0.1:9000 127.0.0.1:7070 2 Alicante,ES 0.33"
+start cmd /k "python EV_CP_M.py 127.0.0.1:6003 127.0.0.1:9000 127.0.0.1:7070 3 Valencia,ES 0.51"
