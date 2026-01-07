@@ -149,11 +149,18 @@ def send_to_central_and_recv(message, timeout=3) -> dict | str:
         if not data:
             return ""
 
-    raw = data.decode("utf-8")
+    raw = data.decode("utf-8").strip()
 
     # Si mandé cifrado, espero respuesta cifrada
     if sent_secure:
-        env = json.loads(raw)
+        if not raw:
+            raise RuntimeError("Central no respondió (vacío). ¿Key revocada / no autenticado?")
+
+        try:
+            env = json.loads(raw)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Respuesta no-JSON de central: {raw}")
+
         if (env.get("action") or "").upper() != "SECURE":
             raise RuntimeError(f"Respuesta no cifrada inesperada: {raw}")
         return decrypt_from_secure_envelope(env)  # devuelve dict en claro
@@ -239,10 +246,16 @@ async def heartbeat_loop():
         while not HB_STOP.is_set():
             resp = ping_engine()
             health = "OK" if resp == "OK" else "KO"
-            out = send_to_central_and_recv(
-                {"action": "HEARTBEAT", "cp_id": CP_ID, "health": health, "ip" : ENGINE_IP},
-                timeout=2
-            )
+            try:
+              out = send_to_central_and_recv(
+                  {"action": "HEARTBEAT", "cp_id": CP_ID, "health": health, "ip" : ENGINE_IP},
+                  timeout=2
+              )
+            except Exception as e:
+                print(f"Heartbeat -> Central error: {e}")
+                await asyncio.sleep(1)
+                continue
+
             print(f"Heartbeat {CP_ID} ({health}) -> Central: {out}")
             await asyncio.sleep(1)
     except asyncio.CancelledError:

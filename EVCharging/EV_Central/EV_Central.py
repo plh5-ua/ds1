@@ -506,6 +506,12 @@ class WeatherUpdate(BaseModel):
     temp_c: float
     alert: bool
 
+PROTECTED_STATUSES = {"DESACTIVADO", "AVERIA", "DESCONECTADO"}
+
+def is_protected(status: str | None) -> bool:
+    return (status or "").upper() in PROTECTED_STATUSES
+
+
 @app.post("/weather/alert")
 async def api_weather_alert(u: WeatherUpdate, request: Request):
     location = (u.location or "").strip()
@@ -555,6 +561,10 @@ async def api_weather_alert(u: WeatherUpdate, request: Request):
     # --- Aplicar efecto a CPs (idempotente) ---
     if new_alert:
         for cp_id in cp_ids:
+            row = get_cp_from_db(cp_id) or {}
+            cur_status = (row.get("status") or "").upper()
+            if is_protected(cur_status):
+                continue
             WEATHER_DISABLED_CPS.add(cp_id)
 
             if cp_id in ACTIVE_SESSIONS:
@@ -570,8 +580,6 @@ async def api_weather_alert(u: WeatherUpdate, request: Request):
                     )
             else:
                 # STOP solo si no está ya PARADO
-                row = get_cp_from_db(cp_id) or {}
-                cur_status = (row.get("status") or "").upper()
                 if cur_status != "PARADO":
                     await send_cp_command("STOP", cp_id, source="weather.alert_on")
                     update_cp(cp_id, "PARADO")
@@ -587,8 +595,11 @@ async def api_weather_alert(u: WeatherUpdate, request: Request):
         for cp_id in cp_ids:
             WEATHER_PENDING_STOP.discard(cp_id)
 
-            # Solo hacemos RESUME si estaba deshabilitado por clima
-            if cp_id in WEATHER_DISABLED_CPS:
+            row = get_cp_from_db(cp_id) or {}
+            cur_status = (row.get("status") or "").upper()
+
+            # Solo hacemos RESUME si estaba deshabilitado por clima y no está protegido
+            if cp_id in WEATHER_DISABLED_CPS and not is_protected(cur_status):
                 WEATHER_DISABLED_CPS.discard(cp_id)
 
                 await send_cp_command("RESUME", cp_id, source="weather.alert_off")
@@ -600,8 +611,7 @@ async def api_weather_alert(u: WeatherUpdate, request: Request):
                 )
 
                 # Si estaba PARADO, lo subimos a ACTIVADO
-                row = get_cp_from_db(cp_id) or {}
-                if (row.get("status") or "").upper() == "PARADO":
+                if cur_status == "PARADO":
                     update_cp(cp_id, "ACTIVADO")
                     await notify_panel({"type": "status", "cp_id": cp_id, "status": "ACTIVADO"})
 
