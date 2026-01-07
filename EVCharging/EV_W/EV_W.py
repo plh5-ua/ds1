@@ -6,9 +6,9 @@
 #   python EV_W.py http://127.0.0.1:8080 TU_API_KEY cities.txt
 #
 # cities.txt (opcional):
-#   Alicante
-#   Madrid
-#   Oslo
+#   Alicante,ES
+#   Madrid,ES
+#   Oslo,NO
 
 import sys, asyncio, json, os
 from dataclasses import dataclass

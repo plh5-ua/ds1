@@ -2,3 +2,4 @@ Alicante,ES
 Valencia,ES
 Oslo,NO
 Madrid,ES
+Moscow,RU

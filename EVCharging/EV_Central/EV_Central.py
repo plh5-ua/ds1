@@ -300,6 +300,20 @@ def end_session(session_id, kwh, amount_eur, ended_status="ENDED"):
         )
         con.commit()
 
+def get_cp_security_state(cp_id: str):
+    with closing(get_db()) as con:
+        reg = con.execute("""
+            SELECT revoked FROM cp_registry_credentials WHERE cp_id=?
+        """, (cp_id,)).fetchone()
+
+        key = con.execute("""
+            SELECT revoked FROM cp_central_keys WHERE cp_id=?
+        """, (cp_id,)).fetchone()
+
+    return {
+        "registered": (reg is not None and int(reg["revoked"]) == 0),
+        "key_active": (key is not None and int(key["revoked"]) == 0),
+    }
 
 # ---------------------------------------------------------------------------
 # AUTH y cifrado
@@ -396,6 +410,10 @@ PANEL_CLIENTS = set()
 def api_list_cps():
     cps = list_cps()
     for cp in cps:
+        sec = get_cp_security_state(cp["id"])
+        cp["registered"] = sec["registered"]
+        cp["key_active"] = sec["key_active"]
+
         lt = LAST_TELEMETRY.get(cp["id"])
         if lt:
             cp["kwh_total"] = lt.get("kwh_total", 0.0)

@@ -47,6 +47,9 @@
         <th>Driver</th>
         <th>Última actualización</th>
         <th>Acciones</th>
+        <th>Registrado</th>
+        <th>Clave</th>
+
       </tr>
     </thead>
     <tbody></tbody>
@@ -121,7 +124,10 @@
         status: cp.status || "DESCONECTADO",
         kwh_total: cp.kwh_total ?? null,
         eur_total: cp.eur_total ?? null,
-        driver_id: cp.driver_id ?? null
+        driver_id: cp.driver_id ?? null,
+        registered: cp.registered ?? false,
+        key_active: cp.key_active ?? false
+
       };
     }
     function fmt(n, digits = 3) {
@@ -138,46 +144,66 @@
         row = document.createElement("tr");
         row.id = cp.id;
         row.innerHTML = `
-          <td>${cp.id}</td>
-          <td>${cp.location}</td>
-          <td>${cp.price_eur_kwh.toFixed(2)}</td>
-          <td class="estado ${cp.status}">${cp.status}</td>
-          <td>${fmt(cp.kwh_total, 3)}</td>
-          <td>${fmt(cp.eur_total, 2)}</td>
-          <td>${cp.driver_id ?? "—"}</td>
-          <td>${now}</td>
-          <td>
+          <td class="cp-id">${cp.id}</td>
+          <td class="cp-location">${cp.location}</td>
+          <td class="cp-price">${cp.price_eur_kwh.toFixed(2)}</td>
+          <td class="cp-status estado ${cp.status}">${cp.status}</td>
+
+          <td class="cp-kwh">${fmt(cp.kwh_total, 3)}</td>
+          <td class="cp-eur">${fmt(cp.eur_total, 2)}</td>
+          <td class="cp-driver">${cp.driver_id ?? "—"}</td>
+          <td class="cp-updated">${now}</td>
+
+          <td class="cp-actions">
             <button class="stop" onclick="sendCommand('STOP', '${cp.id}')">STOP</button>
             <button class="resume" onclick="sendCommand('RESUME', '${cp.id}')">RESUME</button>
             <button class="revoke" onclick="revokeKey('${cp.id}')">REVOKE KEY</button>
           </td>
 
+          <td class="cp-registered">${cp.registered ? "ALTA" : "BAJA"}</td>
+          <td class="cp-key">${cp.key_active ? "ACTIVA" : "REVOCADA"}</td>
         `;
+
+
         tableBody.appendChild(row);
         return;
       }
 
-      if (has(raw, "location")) row.children[1].textContent = raw.location ?? row.children[1].textContent;
-      if (has(raw, "price_eur_kwh")) row.children[2].textContent = Number(raw.price_eur_kwh).toFixed(2);
+      if (has(raw, "location")) {
+        row.querySelector(".cp-location").textContent = raw.location ?? "Desconocida";
+      }
+      if (has(raw, "price_eur_kwh")) {
+        row.querySelector(".cp-price").textContent = Number(raw.price_eur_kwh ?? 0.3).toFixed(2);
+      }
 
       if (has(raw, "status")) {
-        row.children[3].textContent = cp.status;
-        row.children[3].className = "estado " + cp.status;
-        if (raw.status !== "SUMINISTRANDO") {
-          row.children[4].textContent = "—";
-          row.children[5].textContent = "—";
-          row.children[6].textContent = "—";
+        const st = cp.status;
+        const statusTd = row.querySelector(".cp-status");
+        statusTd.textContent = st;
+        statusTd.className = "cp-status estado " + st;
+
+        if (st !== "SUMINISTRANDO") {
+          row.querySelector(".cp-kwh").textContent = "—";
+          row.querySelector(".cp-eur").textContent = "—";
+          row.querySelector(".cp-driver").textContent = "—";
         }
       }
-      if (has(raw, "kwh_total")) row.children[4].textContent = fmt(raw.kwh_total, 3);
-      if (has(raw, "eur_total")) row.children[5].textContent = fmt(raw.eur_total, 2);
-      if (has(raw, "driver_id")) row.children[6].textContent = raw.driver_id ?? "—";
 
-      if (["location","price_eur_kwh","status","kwh_total","eur_total","driver_id"].some(k => has(raw, k))) {
-        row.children[7].textContent = now;
+      if (has(raw, "kwh_total")) row.querySelector(".cp-kwh").textContent = fmt(raw.kwh_total, 3);
+      if (has(raw, "eur_total")) row.querySelector(".cp-eur").textContent = fmt(raw.eur_total, 2);
+      if (has(raw, "driver_id")) row.querySelector(".cp-driver").textContent = raw.driver_id ?? "—";
+
+      if (has(raw, "registered")) {
+        row.querySelector(".cp-registered").textContent = (raw.registered ? "ALTA" : "BAJA");
       }
-    }
+      if (has(raw, "key_active")) {
+        row.querySelector(".cp-key").textContent = (raw.key_active ? "ACTIVA" : "REVOCADA");
+      }
 
+
+      row.querySelector(".cp-updated").textContent = now;
+
+    }
     // --- Helpers sesiones RUNNING (BD) ---
     function rowIdForSession(id) { return `sess-${id}`; }
 
