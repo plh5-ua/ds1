@@ -506,7 +506,7 @@ class WeatherUpdate(BaseModel):
     temp_c: float
     alert: bool
 
-PROTECTED_STATUSES = {"DESACTIVADO", "AVERIA", "DESCONECTADO"}
+PROTECTED_STATUSES = {"DESACTIVADO", "AVERIADO", "DESCONECTADO"}
 
 def is_protected(status: str | None) -> bool:
     return (status or "").upper() in PROTECTED_STATUSES
