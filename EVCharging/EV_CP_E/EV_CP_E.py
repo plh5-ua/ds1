@@ -417,14 +417,20 @@ async def listen_to_central(consumer: AIOKafkaConsumer, producer: AIOKafkaProduc
                 if action == "STOP":
                     STOP.set()
                     STOP_CENTRAL = True
-                    # Si estoy suministrando, dejo que start_charging cierre sesión 
+
+                    # si CENTRAL te manda un reason, úsalo
+                    reason = data.get("reason")
+                    if reason:
+                        global END_REASON
+                        END_REASON = reason
+
                     if STATUS == "SUMINISTRANDO" and CHARGE_TASK and not CHARGE_TASK.done():
-                        print(f"Carga detenida por CENTRAL en {CP_ID}")
+                        print(f"Carga detenida por CENTRAL en {CP_ID} (reason={reason or 'STOP'})")
                     else:
-                        # Si no estaba cargando, solo pongo en PARADO si no lo estaba ya
                         if STATUS != "PARADO":
                             await send_status(producer, "PARADO")
-                        print(f"(Aviso) STOP recibido en {CP_ID}")
+                            print(f"CP {CP_ID} parado por CENTRAL.")
+
 
                 elif action == "RESUME":
                     STOP.clear()

@@ -22,13 +22,13 @@ from typing import Dict, Any, Set, List
 
 
 # --- FastAPI / WebSocket ---
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Header
 from fastapi.staticfiles import StaticFiles
 from requests import request
 import uvicorn
 from fastapi.responses import HTMLResponse
 from pathlib import Path
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # --- Kafka asíncrono ---
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -992,29 +992,48 @@ WEATHER_PENDING_STOP: Set[str] = set()
 
 
 async def force_close_session(cp_id: str, reason_code: str):
-    """
-    Cierra en CENTRAL la sesión activa del cp_id (si existe), usando la última
-    telemetría conocida. Envía ticket al driver, actualiza panel y deja todo limpio.
-    """
+    sess = ACTIVE_SESSIONS.get(cp_id)
+    if not sess:
+        return
+
+    # 0) Pide al Engine que se pare (si está vivo, cortará el bucle)
+    try:
+        await kafka_producer.send_and_wait(
+            "central.command",
+            json.dumps({
+                "action": "STOP",
+                "cp_id": cp_id,
+                "reason": reason_code, 
+                "source": "central.force_close"
+            }).encode("utf-8")
+        )
+    except Exception as e:
+        log_central_msg("FORCE_CLOSE_STOP_SEND_FAIL", {"cp_id": cp_id, "err": str(e)})
+
+    new_status = "PARADO"
+    if reason_code in ("FAULT", "AVERIA"):
+        new_status = "AVERIA"
+    elif reason_code in ("DISCONNECTED",):
+        new_status = "DESCONECTADO"
+
+    update_cp(cp_id, new_status)
+    await notify_panel({"type": "status", "cp_id": cp_id, "status": new_status})
+
     sess = ACTIVE_SESSIONS.pop(cp_id, None)
     if not sess:
         return
 
-    # Última lectura conocida (si no hubo, 0.0)
     lt = LAST_TELEMETRY.pop(cp_id, {}) or {}
     kwh_final = float(lt.get("kwh_total") or 0.0)
     eur_final = float(lt.get("eur_total") or 0.0)
 
-    # Info del CP para ticket
     cp_row = get_cp_from_db(cp_id) or {}
     location = cp_row.get("location")
     unit_price = cp_row.get("price_eur_kwh")
     ip = cp_row.get("ip")
 
-    # Cierra en BD con el código indicado
     end_session(sess["session_id"], kwh_final, eur_final, ended_status=reason_code)
 
-    # Ticket al driver
     await kafka_producer.send_and_wait("driver.update", json.dumps({
         "driver_id": sess["driver_id"],
         "request_id": sess["request_id"],
@@ -1028,15 +1047,15 @@ async def force_close_session(cp_id: str, reason_code: str):
             "amount_eur": eur_final,
             "reason": reason_code
         }
-    }).encode())
+    }).encode("utf-8"))
 
-    # Log + panel
     log_central_msg("SUMINISTRO_FINALIZADO", {
         "cp_id": cp_id, "reason": reason_code,
         "driver_id": sess["driver_id"], "kwh": kwh_final, "amount_eur": eur_final
     })
 
-    insert_audit_log(ip or "unknown", "CP_E_"+cp_id, "SESSION_ENDED", f"Sesión {sess['session_id']} cerrada por {reason_code}, kwh: {kwh_final}, eur: {eur_final}")
+    insert_audit_log(ip or "unknown", "CP_E_"+cp_id, "SESSION_ENDED",
+                     f"Sesión {sess['session_id']} cerrada por {reason_code}, kwh: {kwh_final}, eur: {eur_final}")
 
     await notify_panel({
         "type": "session.ended",
@@ -1048,6 +1067,7 @@ async def force_close_session(cp_id: str, reason_code: str):
         "amount_eur": eur_final,
         "reason": reason_code
     })
+
 
 async def wait_kafka_ready(timeout_sec: float = 3.0) -> bool:
     start = time.monotonic()
@@ -1073,8 +1093,127 @@ async def send_cp_command(action: str, cp_id: str, source: str = "weather") -> b
     await notify_panel({"type": "command.sent", "ts": now_iso(), "source": source, **payload})
     log_central_msg("COMMAND_SENT", {"source": source, **payload})
     return True
+#----------------------------------------------------------------------------
+# INTEGRACIÓN CON EV_REGISTRY (ALTAS/Bajas CPs)
+#----------------------------------------------------------------------------
+INTERNAL_TOKEN = os.getenv("EV_INTERNAL_TOKEN", "CHANGE_ME_INTERNAL_TOKEN")
 
+def require_internal_token(x_internal_token: str | None):
+    if not x_internal_token or x_internal_token != INTERNAL_TOKEN:
+        raise HTTPException(status_code=401, detail="Bad internal token")
 
+def upsert_registry_credential(cp_id: str, cred_hash: str, salt: str, revoked: int = 0):
+    with closing(get_db()) as con:
+        con.execute("""
+            INSERT INTO cp_registry_credentials(cp_id, cred_hash, salt, revoked)
+            VALUES (?,?,?,?)
+            ON CONFLICT(cp_id) DO UPDATE SET
+                cred_hash=excluded.cred_hash,
+                salt=excluded.salt,
+                issued_at=CURRENT_TIMESTAMP,
+                revoked=excluded.revoked
+        """, (cp_id, cred_hash, salt, int(revoked)))
+        con.commit()
+
+def revoke_registry_credential(cp_id: str):
+    with closing(get_db()) as con:
+        con.execute("UPDATE cp_registry_credentials SET revoked=1 WHERE cp_id=?", (cp_id,))
+        con.commit()
+
+def upsert_cp_from_registry(cp_id: str, location: str, price: float, ip: str | None):
+    with closing(get_db()) as con:
+        cur = con.cursor()
+        row = cur.execute("SELECT id FROM charging_points WHERE id=?", (cp_id,)).fetchone()
+        if row:
+            # si tienes columna ip:
+            cur.execute(
+                "UPDATE charging_points SET location=?, price_eur_kwh=?, ip=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (location, price, ip, cp_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO charging_points(id, location, price_eur_kwh, ip, status) VALUES (?,?,?,?, 'DESCONECTADO')",
+                (cp_id, location, price, ip),
+            )
+        con.commit()
+
+class RegistryUpsertReq(BaseModel):
+    cp_id: str = Field(..., min_length=1)
+    location: str = Field(..., min_length=1)
+    price: float = Field(0.30, ge=0.0)
+    ip: str | None = None
+    salt: str = Field(..., min_length=8)
+    cred_hash: str = Field(..., min_length=16)
+    revoked: int = 0
+
+@app.put("/internal/registry/cp/{cp_id}")
+def internal_registry_upsert(
+    cp_id: str,
+    payload: RegistryUpsertReq,
+    request: Request,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token")
+):
+    require_internal_token(x_internal_token)
+
+    cp_id = cp_id.strip()
+    if payload.cp_id.strip() != cp_id:
+        raise HTTPException(status_code=400, detail="cp_id mismatch")
+
+    # 1) persistir CP
+    upsert_cp_from_registry(cp_id, payload.location.strip(), float(payload.price), payload.ip)
+
+    # 2) persistir credenciales del registry (hash+salt)
+    upsert_registry_credential(cp_id, payload.cred_hash, payload.salt, payload.revoked)
+
+    # 3) auditoría en CENTRAL
+    client_ip = (request.client.host if request.client else None) or "unknown"
+    insert_audit_log(
+        client_ip,
+        f"EV_REGISTRY",
+        "ALTA_CP",
+        f"Alta por Registry cp_id={cp_id}, location={payload.location}, price={payload.price}, ip_reported={payload.ip}"
+    )
+
+    cp = get_cp_from_db(cp_id)
+    return {"ok": True, "cp": cp}
+
+@app.delete("/internal/registry/cp/{cp_id}")
+def internal_registry_baja(
+    cp_id: str,
+    request: Request,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token")
+):
+    require_internal_token(x_internal_token)
+    cp_id = cp_id.strip()
+
+    cp = get_cp_from_db(cp_id)
+    if not cp:
+        raise HTTPException(status_code=404, detail="CP no existe")
+
+    # revoke cred + marcar DESCONECTADO
+    revoke_registry_credential(cp_id)
+    update_cp(cp_id, "DESCONECTADO")
+
+    client_ip = (request.client.host if request.client else None) or "unknown"
+    insert_audit_log(
+        client_ip,
+        "EV_REGISTRY",
+        "BAJA_CP",
+        f"Baja por Registry cp_id={cp_id}, location={cp.get('location')}, price={cp.get('price_eur_kwh')}"
+    )
+
+    return {"ok": True, "cp_id": cp_id, "revoked": True, "status": "DESCONECTADO"}
+
+@app.get("/internal/registry/cp/{cp_id}")
+def internal_registry_get_cp(
+    cp_id: str,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token")
+):
+    require_internal_token(x_internal_token)
+    cp = get_cp_from_db(cp_id.strip())
+    if not cp:
+        raise HTTPException(status_code=404, detail="CP no existe")
+    return {"ok": True, "cp": cp}
 
 async def consume_kafka():
     global kafka_consumer
